@@ -83,7 +83,7 @@ DISK_PCT="${HEADLONG_DISK_ALERT_PCT:-90}"
 ALERT_CHANNEL="${HEADLONG_ALERT_CHANNEL:-${SLACK_ALERT_CHANNEL:-${SHELLM_ALERT_CHANNEL:-}}}"
 # Posting token: HEADLONG_ALERT_TOKEN (seeded by deploy/split-bridge-env.sh;
 # ideally a dedicated alert-only app). The bridge's own token is in
-# .env.bridge, which this script cannot read inside the thinkers sandbox.
+# /etc/shellm/slack.env, which only root can read.
 ALERT_TOKEN="${HEADLONG_ALERT_TOKEN:-${SLACK_BOT_TOKEN:-}}"
 
 now=$(date +%s)

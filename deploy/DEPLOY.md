@@ -195,8 +195,10 @@ own migration and none of them need to happen for the unit rename.
   only path in is through Access. Don't "temporarily" bind `0.0.0.0`.
 - Secrets: root key in `/opt/shellm/app/.env` (mode 600); per-identity
   overrides via the Config tab (stored in `<identity>/.env`). The Slack
-  bridge tokens are split out to `/opt/shellm/app/.env.bridge`, which
-  the mind cannot read (`deploy/split-bridge-env.sh`, run by `update.sh`).
+  bridge tokens are split out to `/etc/shellm/slack.env` (root, mode 600),
+  loaded into a bridge that runs as `shellm-slack`, so the mind can read
+  neither the file nor the bridge's environment (`deploy/split-bridge-env.sh`,
+  run by `update.sh`).
 - Every wake runs under a systemd sandbox: filesystem read-only except
   the shellm home, the identity's own directory and the temp dirs. `HEADLONG_SANDBOX=0` in the root `.env` plus `update.sh` and a
   `headlong-thinkersctl restart <identity>` turns it off
