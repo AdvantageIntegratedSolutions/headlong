@@ -28,6 +28,11 @@ if [[ -n "${CONFIG_CAPTURE:-}" ]]; then
     printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$CONFIG_CAPTURE"
 fi
 case "${FAKE_OPENCODE_MODE:-success}" in
+    inline-key)
+        printf 'implemented\n' > delegated.txt
+        printf '%s' "$OPENCODE_CONFIG_CONTENT" | jq -r '.provider.test.options.apiKey'
+        printf '%s' "$OPENCODE_CONFIG_CONTENT" | jq -r '.provider.test.options.apiKey' >&2
+        ;;
     mode-change|mode-only|mode-hook)
         chmod +x run.sh
         if [[ "$FAKE_OPENCODE_MODE" != mode-only ]]; then
@@ -384,6 +389,65 @@ OPENCODE_CONFIG_CONTENT='{"permission":{"bash":"deny"}}' CONFIG_CAPTURE="$WORK/c
 check "string bash permission: deny preserved" jq -e '.permission.bash["*"] == "deny"' "$WORK/config-bash.json"
 OPENCODE_CONFIG_CONTENT='{"permission":"deny"}' CONFIG_CAPTURE="$WORK/config-permission.json" run_case config_permission success
 check "string permission: deny preserved" jq -e '.permission["*"] == "deny"' "$WORK/config-permission.json"
+
+# Existing forced keys must move after later wildcards at both object levels.
+OPENCODE_CONFIG_CONTENT='{"permission":{"task":"allow","external_directory":"allow","bash":{"git push*":"allow","git merge*":"allow","git cherry-pick*":"allow","*":"allow"},"*":"allow","webfetch":"deny"}}' \
+    CONFIG_CAPTURE="$WORK/config-order.json" run_case config_order success
+is "permission order: candidate returned" candidate "$(printf '%s' "$CASE_JSON" | jq -r .status)"
+if python3 - "$WORK/config-order.json" <<'PY_PERMISSIONS'
+import fnmatch, json, sys
+permission = json.load(open(sys.argv[1]))['permission']
+
+def effective(tool, argument):
+    matches = []
+    for name, rules in permission.items():
+        if not fnmatch.fnmatchcase(tool, name):
+            continue
+        if isinstance(rules, str):
+            matches.append(rules)
+        else:
+            matches.extend(action for pattern, action in rules.items()
+                           if fnmatch.fnmatchcase(argument, pattern))
+    return matches[-1] if matches else None
+
+for tool, argument in [('bash', 'git push origin HEAD'), ('bash', 'git merge topic'),
+                       ('bash', 'git cherry-pick abc123'), ('task', 'general'),
+                       ('external_directory', '/tmp/outside')]:
+    assert effective(tool, argument) == 'deny', (tool, argument, permission)
+assert effective('bash', 'echo hello') == 'allow'
+assert effective('webfetch', 'https://example.invalid') == 'deny'
+PY_PERMISSIONS
+then ok "permission order: effective restrictions and unrelated rules preserved"
+else bad "permission order: effective restrictions and unrelated rules preserved"; fi
+
+# The inline credential is deliberately different from the environment key.
+# Include the environment key as a prefix to catch incomplete replacement.
+inline_key='test-secret-value-inline-only'
+inline_config='{"provider":{"test":{"options":{"apiKey":"test-secret-value-inline-only"}}}}'
+inline_verify='printf "%s" "$OPENCODE_CONFIG_CONTENT" | jq -r .provider.test.options.apiKey; printf "%s" "$OPENCODE_CONFIG_CONTENT" | jq -r .provider.test.options.apiKey >&2'
+for sanitizer in working failing; do
+    if [[ "$sanitizer" == working ]]; then
+        OPENCODE_CONFIG_CONTENT="$inline_config" run_case inline_key inline-key "$inline_verify"
+        is "inline key: candidate returned after redaction" candidate "$(printf '%s' "$CASE_JSON" | jq -r .status)"
+    else
+        PATH="$WORK/sanitizer:$PATH" FAIL_SANITIZER_MATCH="$inline_key" \
+            OPENCODE_CONFIG_CONTENT="$inline_config" run_case inline_key_failure inline-key "$inline_verify"
+        is "inline key: sanitizer failure rejects candidate" sanitization_failed "$(printf '%s' "$CASE_JSON" | jq -r .status)"
+        is "inline key: sanitizer failure is nonzero" 1 "$CASE_RC"
+    fi
+    check "$sanitizer inline key: no key or partially redacted suffix in result" \
+        bash -c '! printf "%s" "$1" | grep -qF inline-only' _ "$CASE_JSON"
+    check "$sanitizer inline key: trajectories omit credential" \
+        bash -c '! grep -RqF inline-only "$1"' _ "$FIXTURE_TRAJ_DIR"
+    check "$sanitizer inline key: all transcripts omit credential" \
+        bash -c '! grep -qF inline-only "$1"/*.stdout "$1"/*.stderr' _ "$CASE_OUT"
+    if [[ "$sanitizer" == working ]]; then
+        for stream in executor.stdout executor.stderr verification.stdout verification.stderr; do
+            check "$stream: inline credential replaced" grep -qF '<redacted-api-key>' "$CASE_OUT/$stream"
+        done
+    fi
+done
+
 for config in '{"apiKey":"test-secret-value"' '[]' 'null' '' '{} {}'; do
     OPENCODE_CONFIG_CONTENT="$config" CONFIG_CAPTURE="$WORK/config-invalid.json" \
         coding-agent --repo "$FIXTURE_REPO" --task anything --verify true --out "$WORK/config-invalid" >"$WORK/config-invalid.stdout" 2>"$WORK/config-invalid.stderr"
@@ -393,6 +457,14 @@ for config in '{"apiKey":"test-secret-value"' '[]' 'null' '' '{} {}'; do
     check "malformed config: no output directory created" test ! -e "$WORK/config-invalid"
     check "malformed config: diagnostic contains no key" bash -c '! grep -qF test-secret-value "$1"' _ "$WORK/config-invalid.stderr"
 done
+
+# Reject extraction errors before retaining data or invoking the backend.
+OPENCODE_CONFIG_CONTENT='{"provider":{"test":{"options":{"apiKey":"bad\u0000key"}}}}' \
+    CONFIG_CAPTURE="$WORK/config-nul.json" coding-agent --repo "$FIXTURE_REPO" \
+    --task anything --verify true --out "$WORK/config-nul" >"$WORK/config-nul.stdout" 2>"$WORK/config-nul.stderr"
+is "unrepresentable inline key: rejected" 2 "$?"
+check "unrepresentable inline key: no backend invocation" test ! -e "$WORK/config-nul.json"
+check "unrepresentable inline key: no output directory" test ! -e "$WORK/config-nul"
 
 # N. The exact candidate must reproduce executable bits in a fresh checkout.
 for mode in mode-change mode-only; do
@@ -409,23 +481,28 @@ is "mode hook: committed/worktree mismatch rejected" candidate_commit_failed "$(
 # O. Default and override selection identify the resolved executable without keys.
 ln -s "$WORK/bin/opencode-fake" "$WORK/bin/opencode"
 cp "$WORK/bin/opencode-fake" "$WORK/bin/backend-test-secret-value"
-for selection in default environment argument secret_path; do
+for selection in default environment argument secret_path inline_secret_path; do
     args=()
     [[ "$selection" == argument ]] && args=(--backend-bin "$WORK/bin/opencode")
     selected_backend="$WORK/bin/opencode"
     [[ "$selection" == default ]] && selected_backend=''
-    [[ "$selection" == secret_path ]] && selected_backend="$WORK/bin/backend-test-secret-value"
+    case "$selection" in secret_path|inline_secret_path) selected_backend="$WORK/bin/backend-test-secret-value" ;; esac
     backend_result=$(
         export CODING_AGENT_OPENCODE_BIN="$selected_backend"
         [[ "$selection" == default ]] && unset CODING_AGENT_OPENCODE_BIN
-        PATH="$WORK/bin:$PATH" OPENROUTER_API_KEY=test-secret-value \
+        export OPENROUTER_API_KEY=test-secret-value
+        if [[ "$selection" == inline_secret_path ]]; then
+            unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY LLM_API_KEY
+            export OPENCODE_CONFIG_CONTENT='{"provider":{"test":{"options":{"apiKey":"test-secret-value"}}}}'
+        fi
+        PATH="$WORK/bin:$PATH" \
         coding-agent --repo "$FIXTURE_REPO" --task 'Create delegated.txt' --verify true \
         "${args[@]+"${args[@]}"}" --out "$WORK/backend-$selection" 2>"$WORK/backend-$selection.stderr")
     is "$selection backend: candidate returned" candidate "$(printf '%s' "$backend_result" | jq -r .status)"
     resolved_fake=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WORK/bin/opencode-fake")
     # Keep the resolved parent: macOS's temporary directory may use /var,
     # whose canonical path starts with /private/var.
-    [[ "$selection" == secret_path ]] && resolved_fake="${resolved_fake%/*}/backend-<redacted-api-key>"
+    case "$selection" in secret_path|inline_secret_path) resolved_fake="${resolved_fake%/*}/backend-<redacted-api-key>" ;; esac
     is "$selection backend: result records resolved executable" "$resolved_fake" "$(printf '%s' "$backend_result" | jq -r .backend_executable)"
     backend_child="$WORK/backend-$selection/trajectories/$(printf '%s' "$backend_result" | jq -r .child_traj_ref)"
     is "$selection backend: delegation records executable" "$resolved_fake" "$(jq -r 'select(.type == "delegation") | .backend_executable' "$backend_child")"

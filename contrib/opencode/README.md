@@ -83,6 +83,8 @@ and trajectory paths inside the package (including symlink aliases) are rejected
 Transcript sanitization failures reject the candidate and replace the affected
 transcript with a withholding notice. Results and trajectories include artifact
 references and bounded sanitized summaries; full transcripts remain in artifacts.
+Redaction covers the known provider API-key environment variables and inline
+`apiKey` values in `OPENCODE_CONFIG_CONTENT`, including backend override notices.
 To clean up evidence manually after review, remove its Git worktree with
 `git -C SOURCE worktree remove WORKTREE`, delete the candidate branch if no
 longer needed, and then remove the artifact directory. Review trajectory

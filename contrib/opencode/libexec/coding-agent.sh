@@ -36,11 +36,9 @@ EOF
 die() { printf 'coding-agent: error: %s\n' "$*" >&2; exit 2; }
 
 redact_file() {
-    local file="$1" name value temporary
+    local file="$1" value temporary
     [[ -f "$file" ]] || return 1
-    for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY LLM_API_KEY; do
-        value="${!name:-}"
-        [[ -n "$value" ]] || continue
+    for value in "${redaction_values[@]+"${redaction_values[@]}"}"; do
         temporary=$(mktemp "$file.redacted.XXXXXX") || return 1
         if ! SECRET_VALUE="$value" perl -pe '
             BEGIN { $secret = $ENV{SECRET_VALUE}; }
@@ -55,10 +53,8 @@ redact_file() {
 
 # Paths may contain a configured key too; never echo one in override metadata.
 redact_text() {
-    local text="$1" name value
-    for name in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY LLM_API_KEY; do
-        value="${!name:-}"
-        [[ -n "$value" ]] || continue
+    local text="$1" value
+    for value in "${redaction_values[@]+"${redaction_values[@]}"}"; do
         text="${text//"$value"/<redacted-api-key>}"
     done
     printf '%s' "$text"
@@ -223,15 +219,42 @@ opencode_guard=$(printf '%s' "$opencode_config" | jq -cse '
     . as $base
     | ($base.permission | rules) as $permission
     | ($permission.bash | rules) as $bash
-    | $base * {
+    # OpenCode uses the last matching rule. Replace these objects rather than
+    # recursively merging them, which would retain the original key order.
+    | $base + {
         share: "disabled",
-        permission: ($permission * {
+        permission: (($permission | del(.external_directory, .task, .bash)) + {
             external_directory: "deny", task: "deny",
-            bash: ($bash * {
+            bash: (($bash | del(."git push*", ."git merge*", ."git cherry-pick*")) + {
                 "git push*": "deny", "git merge*": "deny", "git cherry-pick*": "deny"
             })
         })
       }' 2>/dev/null) || die "OPENCODE_CONFIG_CONTENT must be a valid JSON object with valid permission rules"
+
+# Collect the same secrets for transcript and diagnostic redaction. Keep them
+# off argv, including during extraction; longer values must be replaced first
+# when an inline key contains another configured key. The final empty NUL record
+# confirms extraction succeeded, since process substitution hides its exit code.
+redaction_values=()
+redaction_ready=false
+while IFS= read -r -d '' value; do
+    if [[ -z "$value" ]]; then
+        redaction_ready=true
+        break
+    fi
+    redaction_values+=("$value")
+done < <(
+    printf '%s' "$opencode_config" | jq -j '
+        [env.ANTHROPIC_API_KEY, env.OPENAI_API_KEY, env.GEMINI_API_KEY,
+         env.OPENROUTER_API_KEY, env.OPENCODE_API_KEY, env.LLM_API_KEY,
+         (.. | objects | .apiKey?)]
+        | map(select(type == "string" and length > 0))
+        | unique | sort_by(length) | reverse | .[]
+        | if contains("\u0000") then error("NUL in API key")
+          else ., "\u0000" end
+    ' 2>/dev/null && printf '\0'
+)
+[[ "$redaction_ready" == true ]] || die "could not collect API keys for redaction"
 
 backend_override=''
 if [[ -n "$backend_bin" ]]; then
