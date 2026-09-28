@@ -121,6 +121,49 @@ rm -f "$MEM_DIR"/*.md
 out=$(mem search "anything" 2>&1)
 if [[ "$out" == *"No memories stored"* ]]; then ok "empty store says so"; else bad "empty store says so" "$out"; fi
 
+# --- 7. a wedged model call is cut at the bound (issue 119) ---------------
+# The heartbeat feeds the host's inactivity watchdog by design, so a model
+# call that never returns is cut by nothing else and the wake wedges behind
+# it. Stage 2 carries its own deadline now. The orphan check reads captured
+# stderr after a settle: a file that stays quiet means the heartbeat cleanup
+# ran. No process-table check; pgrep -f matches the runner's own line.
+mkdir -p "$WORK/mem4"; export MEM_DIR="$WORK/mem4"
+mk "2026-09-16-00-00-06" "zanzibar note" "A note about the zanzibar dispatcher."
+cat > "$WORK/bin/llm" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null; sleep 30
+STUB
+start=$SECONDS
+out=$(MEM_SEARCH_TIMEOUT_S=1 MEM_SEARCH_HEARTBEAT_S=0.2 timeout 10 mem search "zanzibar" 2>"$WORK/err7"); rc=$?
+elapsed=$((SECONDS - start))
+sz7=$(wc -c < "$WORK/err7"); sleep 1; sz7b=$(wc -c < "$WORK/err7")
+if [[ "$rc" -eq 124 && "$elapsed" -le 5 ]] && grep -q "no reply from the model within 1s" "$WORK/err7" \
+   && [[ "$sz7b" -eq "$sz7" ]]; then
+    ok "a wedged model call is cut at MEM_SEARCH_TIMEOUT_S, exits 124, cleans its heartbeat"
+else
+    bad "a wedged model call is cut at MEM_SEARCH_TIMEOUT_S" "rc=$rc elapsed=$elapsed err=$sz7/$sz7b"
+fi
+
+# MEM_SEARCH_TIMEOUT_S=0 restores the old unbounded wait.
+cat > "$WORK/bin/llm" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null; sleep 1.5; echo "unbounded reply"
+STUB
+out=$(MEM_SEARCH_TIMEOUT_S=0 mem search "zanzibar" 2>"$WORK/err8"); rc=$?
+if [[ "$rc" -eq 0 && "$out" == "unbounded reply" ]] && ! grep -q "no reply" "$WORK/err8"; then
+    ok "MEM_SEARCH_TIMEOUT_S=0 keeps the unbounded wait"
+else
+    bad "MEM_SEARCH_TIMEOUT_S=0 keeps the unbounded wait" "rc=$rc out=$out"
+fi
+
+# Give later sections back the recording stub.
+cat > "$WORK/bin/llm" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$LLM_STUB_ARGS"
+cat > "$LLM_STUB_PROMPT"
+echo "stub reply"
+STUB
+
 # BM25 scoring (2026-09-04): a term once in a short file outranks the same
 # term once in a long file, and `mem prefilter` exposes the stage-1 ranking.
 mkdir -p "$WORK/mem2"; export MEM_DIR="$WORK/mem2"

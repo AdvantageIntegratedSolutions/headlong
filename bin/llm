@@ -1313,7 +1313,18 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
         # deadline can kill its whole tree: a shell adapter's provider
         # child would otherwise survive a PID-targeted kill and hold the
         # caller's stdout open past the deadline.
-        set -m
+        # mem search owns a cancellable worker group. Do not escape it:
+        # killing llm before its separately grouped adapter would orphan the
+        # adapter and disable this watcher. This private per-call opt-in is
+        # only for a caller which owns (and can kill) its whole process group.
+        _adapter_shared_group=""
+        if [[ "${_LLM_SHARED_PROCESS_GROUP:-0}" == 1 ]]; then
+            _adapter_shared_group=$(ps -o pgid= -p "$$") || die "Cannot read adapter process group"
+            _adapter_shared_group="${_adapter_shared_group//[[:space:]]/}"
+            [[ "$_adapter_shared_group" =~ ^[0-9]+$ && "$_adapter_shared_group" -gt 1 ]] || die "Invalid adapter process group"
+        else
+            set -m
+        fi
         "$LLM_ADAPTER" "${_adapter_args[@]}" < "$payload_file" &
         _adapter_pid=$!
         set +m
@@ -1336,6 +1347,15 @@ if [[ "$LLM_PROVIDER" == "adapter" ]]; then
                 if [[ -e "$_adapter_dir/done" ]]; then
                     rm -f "$_adapter_dir/deadline"
                 else
+                    if [[ -n "$_adapter_shared_group" ]]; then
+                        # We share the cancellation group, so TERM would
+                        # kill our supervisor and watcher before escalation.
+                        # Force the whole group closed at the inner deadline;
+                        # do not silently replace a shorter LLM_MAX_TIME
+                        # with mem's outer deadline.
+                        kill -KILL -- "-$_adapter_shared_group" 2>/dev/null
+                        exit 0
+                    fi
                     kill -- -"$_adapter_pid" 2>/dev/null
                     _g=0
                     # Check the process group, not only its leader. The
