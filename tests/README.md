@@ -20,6 +20,11 @@ and shellcheck at warning level.
 
 `test_contrib_opencode.sh` runs the optional package’s offline lifecycle, integrity, and scripted rejection/revision tests. See [package setup](../contrib/opencode/README.md).
 
+`test_traj_redaction.sh` requires Python 3 and checks credential masking before
+JSONL and blob writes, sanitizer failure, and context/recap replay. It also runs
+real `shellm` traces with a scripted LLM in a temporary HOME; all credentials
+are synthetic and no inference or network calls are made.
+
 `test_responder_reply_guard.sh` exercises bounded model calls and reply parsing
 against a scratch identity with a scripted backend. Standalone `<skills show ...>`
 replies defer the original request to the mind and send a holding message;
