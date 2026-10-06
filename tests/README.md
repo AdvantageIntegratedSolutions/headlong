@@ -20,6 +20,11 @@ and shellcheck at warning level.
 
 `test_contrib_opencode.sh` runs the optional package’s offline lifecycle, integrity, and scripted rejection/revision tests. See [package setup](../contrib/opencode/README.md).
 
+`test_deploy_update.sh` uses Python 3 and local git repositories to reproduce
+an upgrade from the historical pre-guard updater (fixture from `bbb1104`).
+System commands and HTTP are stubbed; tests check pending/applied deployment
+files, login/status warnings, disabled sandbox behavior and secret-free output.
+
 `test_traj_redaction.sh` requires Python 3 and checks credential masking before
 JSONL and blob writes, sanitizer failure, and context/recap replay. It also runs
 real `shellm` traces with a scripted LLM in a temporary HOME; all credentials
