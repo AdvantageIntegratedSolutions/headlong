@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Exercise live contention and offline recovery after interrupted process trees.
+# Exercise live contention, takeover of a lock whose holder was killed, and
+# offline recovery after interrupted process trees.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$REPO" <<'PY'
@@ -81,7 +82,59 @@ exit 1
             os.killpg(worker.pid, stop_signal)
             worker.communicate(timeout=5)
             message("m3")
-            assert history() == ["m1"], "interrupted lock must not be stolen automatically"
+            lock = trajectory_dir / "messages.jsonl.lock"
+            assert lock.is_dir(), "fixture: the killed updater should leave its lock"
+            # Model the same killed writer having appended rows but not its
+            # cursor: the next reader must drop them, not index m2 twice.
+            # (The first read above recorded no sizes on an old-format
+            # cursor only; this cursor is current, so the sizes are there.)
+            with index.open("a") as stream:
+                stream.write('{"step_id":"m2","ts":"2026-01-01T00:00:00Z","from":"reader","to":"ada","content":"hello"}\n{"step_id":"par')
+            taken = subprocess.run(command, env=env, cwd=work, capture_output=True,
+                                   text=True, check=True, timeout=5)
+            assert [e["step_id"] for e in json.loads(taken.stdout)] == ["m1", "m2", "m3"], \
+                "a reader did not take over the lock of a killed updater"
+            assert "took over the message index lock" in taken.stderr
+            assert "interrupted index update" in taken.stderr
+            rows = [json.loads(line)["step_id"] for line in index.read_text().splitlines()]
+            assert rows == ["m1", "m2", "m3"], "takeover duplicated or lost indexed messages"
+            assert not lock.exists(), "takeover left the lock behind"
+            # A lock with no owner record is left alone while it is fresh
+            # (its holder may be between mkdir and the owner write) and taken
+            # over once it is older than the grace period.
+            lock.mkdir()
+            message("m4")
+            assert history() == ["m1", "m2", "m3"], "a fresh ownerless lock was taken over"
+            old = time.time() - 3600
+            os.utime(lock, (old, old))
+            assert history() == ["m1", "m2", "m3", "m4"], "an old ownerless lock was not taken over"
+            # A recorded holder that is still running keeps its lock, however old.
+            sleeper = subprocess.Popen(["sleep", "30"])
+            try:
+                start = subprocess.run(["ps", "-o", "lstart=", "-p", str(sleeper.pid)],
+                                       env=dict(os.environ, LC_ALL="C", TZ="UTC"),
+                                       capture_output=True, text=True, check=True).stdout
+                ns = os.readlink("/proc/self/ns/pid") if os.path.exists("/proc/self/ns/pid") else "-"
+                lock.mkdir()
+                (lock / "owner").write_text("%d %s %s\n" % (sleeper.pid, ns, "_".join(start.split())))
+                os.utime(lock, (old, old))
+                message("m5")
+                assert history() == ["m1", "m2", "m3", "m4"], "a running holder's lock was taken over"
+                refused = subprocess.run(["bash", str(repo / "bin/chat"), "index-reset", "--offline"],
+                                         env=env, cwd=work, capture_output=True, timeout=5)
+                assert refused.returncode != 0 and index.exists(), "reset ignored a running lock holder"
+            finally:
+                sleeper.kill()
+                sleeper.wait()
+            # The same record now names a process that is gone.
+            assert history() == ["m1", "m2", "m3", "m4", "m5"], "a dead holder's lock was not taken over"
+            # Leave a held lock for the offline reset checks below.
+            lock.mkdir()
+            (lock / "owner").write_text("1 other-namespace x\n")
+            message("m6")
+            assert history() == ["m1", "m2", "m3", "m4", "m5"], "judged a holder in another pid namespace"
+            (lock / "owner").unlink()
+            os.utime(lock, None)
             before = trajectory.read_bytes()
             reset = ["bash", str(repo / "bin/chat"), "index-reset"]
             refused = subprocess.run(reset, env=env, cwd=work, capture_output=True, timeout=5)
@@ -95,9 +148,10 @@ exit 1
             assert trajectory.read_bytes() == before, "reset touched the source trajectory"
             for name in ("messages.jsonl", "messages.jsonl.offset", "deferrals.jsonl", "deliveries.jsonl", "messages.jsonl.lock"):
                 assert not (trajectory_dir / name).exists(), name + " survived reset"
-            assert history() == ["m1", "m2", "m3"], "offline reset did not restore indexing"
+            everything = ["m1", "m2", "m3", "m4", "m5", "m6"]
+            assert history() == everything, "offline reset did not restore indexing"
             rows = [json.loads(line)["step_id"] for line in index.read_text().splitlines()]
-            assert rows == ["m1", "m2", "m3"], "recovery duplicated or lost indexed messages"
+            assert rows == everything, "recovery duplicated or lost indexed messages"
             assert history() == rows, "recovery left a lock behind"
             lock = trajectory_dir / "messages.jsonl.lock"
             lock.mkdir()
@@ -127,7 +181,7 @@ exit 1
                 subprocess.run(reset + ["--offline"], env=env, cwd=work,
                                capture_output=True, check=True, timeout=5)
             assert history() == rows, "reset is not idempotent"
-            print("ok live contention, guarded reset, and offline recovery after " + stop_signal.name)
+            print("ok live contention, takeover from a dead holder, guarded reset, and offline recovery after " + stop_signal.name)
         finally:
             try:
                 os.killpg(worker.pid, signal.SIGKILL)

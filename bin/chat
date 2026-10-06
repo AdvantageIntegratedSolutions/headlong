@@ -499,24 +499,114 @@ _traj_header_id() {
 
 _file_ino() { stat -c %i -- "$1" 2>/dev/null || stat -f %i -- "$1" 2>/dev/null || echo ""; }
 
+# The index lock is the directory <index>.lock. The holder records itself in
+# <lock>/owner as "pid pid-namespace start-time". A reader killed with SIGKILL
+# (the step watchdog does this) cannot release the lock, and until 2026-10-06
+# that left the index stuck until an operator reset it. Now the next caller
+# takes the lock over when the recorded process is gone. The start time guards
+# against a reused pid, and a holder in another pid namespace (a container) is
+# never judged, because its pid means nothing here. A lock with no owner file
+# is taken over only after _INDEX_LOCK_GRACE seconds: the gap between mkdir and
+# the owner write is far shorter than that. Taking over is safe because
+# _index_update_locked first cuts the index files back to the sizes of the
+# last completed update (see _index_trim).
+_INDEX_LOCK_GRACE=60
+_file_mtime() { stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null || echo 0; }
+_proc_start() { LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//;s/_$//'; }
+_pid_ns() { local ns; ns=$(readlink /proc/self/ns/pid 2>/dev/null) || ns=""; printf '%s' "${ns:--}"; }
+
+_index_lock_claim() {
+    printf '%s %s %s\n' "$$" "$(_pid_ns)" "$(_proc_start "$$")" > "$1/owner.$$" 2>/dev/null \
+        && mv -f "$1/owner.$$" "$1/owner" 2>/dev/null || true
+}
+
+# 0: the holder is gone and the lock can be taken over. 1: leave it alone.
+_index_lock_abandoned() {
+    local lock="$1" opid="" ons="" ostart="" mine
+    [[ -d "$lock" && ! -L "$lock" ]] || return 1
+    mine=$(_proc_start "$$")
+    [[ -n "$mine" ]] || return 1    # cannot see even this process: judge nobody
+    if [[ -f "$lock/owner" ]]; then read -r opid ons ostart < "$lock/owner" || true; fi
+    if [[ ! "$opid" =~ ^[0-9]+$ ]]; then
+        (( $(date +%s) - $(_file_mtime "$lock") >= _INDEX_LOCK_GRACE ))
+        return
+    fi
+    [[ "$ons" == "$(_pid_ns)" ]] || return 1
+    [[ "$(_proc_start "$opid")" != "$ostart" ]]
+}
+
+_index_lock() {
+    local lock="$1" got=1
+    if mkdir "$lock" 2>/dev/null; then _index_lock_claim "$lock"; return 0; fi
+    _index_lock_abandoned "$lock" || return 1
+    # One caller at a time decides a takeover, and decides it again once it
+    # is alone: the lock may have been released or taken over in between.
+    if ! mkdir "$lock.steal" 2>/dev/null; then
+        if (( $(date +%s) - $(_file_mtime "$lock.steal") >= _INDEX_LOCK_GRACE )); then
+            rmdir "$lock.steal" 2>/dev/null || true
+        fi
+        return 1
+    fi
+    if mkdir "$lock" 2>/dev/null || _index_lock_abandoned "$lock"; then
+        _index_lock_claim "$lock"; got=0
+        printf 'chat: took over the message index lock from a process that is gone\n' >&2
+    fi
+    rmdir "$lock.steal" 2>/dev/null || true
+    return "$got"
+}
+
+_index_unlock() {
+    local lock="$1" opid=""
+    if [[ -f "$lock/owner" ]]; then read -r opid _ < "$lock/owner" || true; fi
+    [[ -z "$opid" || "$opid" == "$$" ]] || return 0   # taken over: not ours to release
+    rm -f "$lock/owner" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+}
+
 _index_update() {
     local tf="$1" idx="$2" lock="$2.lock" rc
     # Lock before reading the offset or deciding to rebuild. Otherwise two
     # readers can snapshot the same offset and the later lock holder can
-    # append the range that the earlier one already indexed.
-    mkdir "$lock" 2>/dev/null || return 0
+    # append the range that the earlier one already indexed. A caller that
+    # does not get the lock just uses what is there.
+    _index_lock "$lock" || return 0
     if _index_update_locked "$tf" "$idx"; then rc=0; else rc=$?; fi
-    rmdir "$lock" 2>/dev/null
+    _index_unlock "$lock"
     return "$rc"
+}
+
+# The offset record ends with the byte sizes of the three index files at the
+# last completed update. An updater killed part way has appended rows the
+# record does not cover, and the next update would append them again. So cut
+# each file back to its recorded size first. A file shorter than recorded was
+# emptied or replaced by something else; report that (1) so the caller
+# rebuilds. $1 = file, $2 = recorded size.
+_index_trim() {
+    local f="$1" want="$2" have
+    have=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || have=0
+    (( have >= want )) || return 1
+    (( have == want )) && return 0
+    printf 'chat: dropping %s bytes an interrupted index update left in %s\n' "$((have - want))" "${f##*/}" >&2
+    head -c "$want" -- "$f" > "$f.trim" && mv -f "$f.trim" "$f"
+}
+
+_index_record() {
+    local idx="$1" off="$2" n="$3" header="$4" tf="$5" size="$6" f sizes=""
+    for f in "$idx" "$(_deferrals_path "$idx")" "$(_deliveries_path "$idx")"; do
+        sizes+=" $(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)"
+    done
+    printf '%s %s %s %s%s\n' "$n" "$header" "$(_file_ino "$tf")" "$size" "$sizes" > "$off.new" \
+        && mv -f "$off.new" "$off"
 }
 
 _index_update_locked() {
     local tf="$1" idx="$2" off="$2.offset"
     local header have_off have_header have_ino size ino why=""
+    local have_isz have_dsz have_vsz
     header=$(_traj_header_id "$tf")
-    have_off=0; have_header=""; have_ino=""
+    have_off=0; have_header=""; have_ino=""; have_isz=""; have_dsz=""; have_vsz=""
     if [[ -f "$off" ]]; then
-        read -r have_off have_header have_ino _ < "$off" || true
+        read -r have_off have_header have_ino _ have_isz have_dsz have_vsz _ < "$off" || true
         [[ "$have_off" =~ ^[0-9]+$ ]] || have_off=0
     fi
     size=$(wc -c < "$tf" | tr -d ' ')
@@ -530,10 +620,17 @@ _index_update_locked() {
         why="trajectory file replaced (inode $have_ino -> $ino)"
     elif (( have_off > 0 && size < have_off )); then
         why="trajectory shrank below the index offset ($size < $have_off)"
+    elif [[ "$have_isz" =~ ^[0-9]+$ && "$have_dsz" =~ ^[0-9]+$ && "$have_vsz" =~ ^[0-9]+$ ]]; then
+        _index_trim "$idx" "$have_isz" && _index_trim "$dfr" "$have_dsz" && _index_trim "$dlv" "$have_vsz" \
+            || why="an index file is shorter than the last update recorded"
     fi
     if [[ -n "$why" ]]; then
         [[ "$why" != "no index yet" ]] && printf 'chat: rebuilding the message index from the start: %s\n' "$why" >&2
         have_off=0
+        # Record the restart before emptying anything, so an update killed
+        # from here on resumes as a rebuild from byte zero, never as an
+        # append at the old offset onto emptied files.
+        printf '0 %s %s 0 0 0 0\n' "$header" "${ino:--}" > "$off.new" && mv -f "$off.new" "$off" || return 1
         : > "$idx.rebuild" || return 1
         mv -f "$idx.rebuild" "$idx"
         : > "$dfr.rebuild" || return 1
@@ -542,10 +639,11 @@ _index_update_locked() {
         mv -f "$dlv.rebuild" "$dlv"
     fi
     if (( size <= have_off )); then
-        # Nothing new. Upgrade a pre-inode offset record in passing so the
-        # next replacement is caught.
-        if [[ -z "$have_ino" && -n "$ino" ]]; then
-            printf '%s %s %s %s\n' "$have_off" "$header" "$ino" "$size" > "$off" 2>/dev/null || true
+        # Nothing new. Upgrade an older offset record (no inode, or no index
+        # sizes) in passing so the next replacement or interrupted update is
+        # caught.
+        if [[ ( -z "$have_ino" && -n "$ino" ) || -z "$have_vsz" ]]; then
+            _index_record "$idx" "$off" "$have_off" "$header" "$tf" "$size" 2>/dev/null || true
         fi
         return 0
     fi
@@ -606,8 +704,10 @@ _index_apply() {
                 | {step_id, ts, trigger_step, status, transport, reason, permalink, channel, message_ts}
                 | with_entries(select(.value != null))' -R >> "$(_deliveries_path "$idx")" 2>/dev/null || true
     fi
-    # Record the inode and the size the offset refers to (see _index_update).
-    printf '%s %s %s %s\n' "$((have_off + len))" "$header" "$(_file_ino "$tf")" "$size" > "$off"
+    # Record the inode and the size the offset refers to (see _index_update),
+    # and the index sizes this update leaves behind (see _index_trim). The
+    # record is replaced in one rename, so a kill never leaves half of it.
+    _index_record "$idx" "$off" "$((have_off + len))" "$header" "$tf" "$size"
 }
 
 # Operator recovery after every chat caller has stopped. The index can have
@@ -622,10 +722,18 @@ cmd_index_reset() {
     [[ ! -L "$lock" ]] || die "index-reset: refusing a symlinked lock"
     mkdir "$lock" 2>/dev/null || [[ -d "$lock" ]] || die "index-reset: cannot create lock"
     # Unknown contents are not ours to remove. Never recursively delete a lock.
+    # The owner record is ours; a holder that is still running is not offline.
     contents=$(ls -A "$lock") || die "index-reset: cannot inspect lock directory"
+    if [[ "$contents" == owner ]]; then
+        _index_lock_abandoned "$lock" || die "index-reset: the lock holder is still running (see $lock/owner)"
+        rm -f "$lock/owner" || die "index-reset: cannot remove the owner record"
+        contents=""
+    fi
     [[ -z "$contents" ]] || die "index-reset: lock directory is not empty"
     rm -f "$idx.offset" "$idx" "$(_deferrals_path "$idx")" "$(_deliveries_path "$idx")" \
         || die "index-reset: could not remove derived indexes; lock retained"
+    rm -f "$idx.offset.new" "$idx.trim" 2>/dev/null || true
+    rmdir "$lock.steal" 2>/dev/null || true
     rmdir "$lock" || die "index-reset: could not remove lock"
     printf 'Chat indexes reset. The next history, pending, or sent read will rebuild them.\n'
 }

@@ -195,7 +195,9 @@ fi
 # --- chat index lock -------------------------------------------------------
 # Trajectory activity does not prove that the derived chat indexes advance.
 # Alert only: age alone cannot distinguish an abandoned lock from a slow live
-# rebuild. Recovery must stop every caller before removing the lock/indexes.
+# rebuild. bin/chat itself takes over a lock whose recorded holder is gone, so
+# a lock this old has a holder that is still running or that chat could not
+# judge. Recovery must stop every caller before removing the lock/indexes.
 chat_index_check() {
     [[ -n "$traj" && -f "$traj" ]] || return 0
     local lock stamp age

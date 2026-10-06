@@ -1,15 +1,37 @@
 # Recover a stuck chat index
 
 `chat history --with`, `chat pending`, and `chat sent` share derived indexes
-next to the root trajectory. An updater killed before releasing
-`messages.jsonl.lock` can leave those indexes stuck. Calls still return, but
-new messages, requests, and delivery notices are absent from the indexes.
+next to the root trajectory. One reader at a time updates them, holding the
+lock directory `messages.jsonl.lock`.
 
-The box's existing silence timer alerts when the lock directory is older
-than `HEADLONG_SILENCE_SECS` (30 minutes by default), even if the trajectory
-is still growing. The alert repeats at `HEADLONG_SILENCE_REPOST_SECS`.
-A long rebuild can also hold the lock, so the watchdog never deletes it
-based on age. Check for a live rebuild before beginning recovery.
+## What recovers without an operator
+
+A reader killed while it holds the lock (the step watchdog kills with
+SIGKILL, which no shell trap can catch) no longer leaves the indexes stuck.
+The holder records its process id, pid namespace, and start time in
+`messages.jsonl.lock/owner`. The next reader sees that the recorded process
+is gone and takes the lock over. Before it indexes anything it cuts each
+index file back to the size the last completed update recorded in
+`messages.jsonl.offset`, so rows a killed update appended are dropped and
+then indexed once. Both steps print a line on stderr.
+
+A lock with no owner record is taken over once it is 60 seconds old.
+
+## What still needs an operator
+
+A reader leaves a lock alone when its holder is still running, or when the
+holder recorded a different pid namespace (a reader inside a container
+cannot judge a process on the host, and the reverse). A holder that hangs
+for good, or one in another namespace that was killed, still leaves the
+indexes stuck. Calls return, but new messages, requests, and delivery
+notices are absent.
+
+The box's silence timer alerts when the lock directory is older than
+`HEADLONG_SILENCE_SECS` (30 minutes by default), even if the trajectory is
+still growing. The alert repeats at `HEADLONG_SILENCE_REPOST_SECS`. A long
+rebuild can also hold the lock that long, so nothing deletes a lock based
+on age alone. Read `messages.jsonl.lock/owner` and check whether that
+process is a live rebuild before beginning recovery.
 
 ## Stop, reset, and restart
 
@@ -44,8 +66,8 @@ and `messages.jsonl.offset`, then removes the empty lock directory. Resetting
 all derived data also removes partial writes from an interrupted update.
 The trajectory itself is unchanged. If removal fails, the lock is retained
 so the next reader cannot extend a partially reset index. The command refuses
-a symlinked or nonempty lock directory and never deletes one recursively.
+a symlinked lock directory, one that holds anything but the owner record,
+and one whose recorded holder is still running in this pid namespace. It
+never deletes a lock recursively.
 
-Use the same stopped-caller procedure on a local install. SIGKILL cannot be
-handled by a shell trap; recovery is deliberately an operator action at a
-stopped service boundary, rather than automatic lock stealing during reads.
+Use the same stopped-caller procedure on a local install.
