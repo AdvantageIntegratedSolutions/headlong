@@ -10,6 +10,8 @@ output change.
 
 `run-all.sh` runs every `test_*.sh` in turn and summarizes (optionally
 filtered by a name substring, e.g. `tests/run-all.sh recap`).
+`TEST_SHARD=i/n tests/run-all.sh` runs only slice `i` of `n`; CI uses it
+to split the suite across runners.
 `smoke_install.sh` exercises `install.sh` in both of its modes (checkout
 and `curl | bash`) inside throwaway HOME directories.
 

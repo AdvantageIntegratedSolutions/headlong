@@ -5,8 +5,10 @@
 # smoke test clones from the workspace instead of GitHub. No secrets needed
 # except for the failure alert at the end.
 #
-# Jobs (all run in parallel, ~3 min wall clock):
-#   harness        tests/run-all.sh            bash tests for bin/ and tools/
+# Jobs (all run in parallel, ~6 min wall clock):
+#   harness        tests/run-all.sh            bash tests for bin/ and tools/,
+#                                               split over 3 runners with
+#                                               TEST_SHARD (see run-all.sh)
 #   python         pytest                       web, slack, telegram (matrix)
 #   viewer         bun test + typecheck + build web/viewer (what the box builds)
 #   tui            cargo fmt/clippy/check       tui/headlong
@@ -15,8 +17,9 @@
 #                                               macOS's stock /bin/bash (3.2):
 #                                               syntax parse, a grep for
 #                                               bash-4-only constructs, and
-#                                               tests/run-all.sh, on a macOS
-#                                               runner with bash 3.2 as `bash`
+#                                               tests/run-all.sh, on macOS
+#                                               runners with bash 3.2 as `bash`
+#                                               (4 runners, split by TEST_SHARD)
 #   install-smoke  tests/smoke_install.sh       install.sh, both modes, in a
 #                                               bare ubuntu:24.04 container
 #   gitleaks       gitleaks git (full history)  secrets; allowlist in .gitleaks.toml
@@ -57,10 +60,18 @@ permissions:
 
 jobs:
   harness:
-    name: bash tests
+    name: bash tests (${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The suite takes about 11 minutes on one runner, so it is split into
+    # slices that run side by side. tests/run-all.sh balances the slices by
+    # wall time. To change the count, change only this list.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
+      TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
       # The runner has a live Docker daemon, and shellm switches to Docker
       # mode whenever `docker info` succeeds. The harness tests stub llm on
       # the host, so force host execution here (tests that spawn shellm pin
@@ -147,7 +158,7 @@ jobs:
           echo "$files" | wc -l | xargs echo "checking files:"
           echo "$files" | xargs shellcheck -S warning
   macos:
-    name: macOS (bash 3.2)
+    name: macOS (bash 3.2) (${{ matrix.shard }}/${{ strategy.job-total }})
     # Headlong has to run on a stock Mac, whose /bin/bash is 3.2 (Apple never
     # shipped a GPLv3 bash). Bash-4 expansions like ${x^^} are a fatal "bad
     # substitution" there, which once made every shellm run on macOS exit
@@ -160,10 +171,19 @@ jobs:
     # Scope is the product: bin/ thinkers/ tools/ tests/ and the root
     # scripts. deploy/ is Linux-only (systemd) or laptop operator tooling
     # that runs under Homebrew bash, so it is left out.
+    # The harness takes about 15 minutes on one macOS runner, so it is split
+    # into slices like the Linux job. Four is the useful limit: the slowest
+    # script (test_contrib_opencode.sh, about 4.5 minutes) fills one slice
+    # alone. Checks 1 and 2 take a second and run in the first slice only.
     runs-on: macos-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       SHELLM_ENV: local
+      TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v5
       - name: Tools the harness shells out to
@@ -186,6 +206,7 @@ jobs:
           bash -c 'echo "BASH_VERSION=$BASH_VERSION"; [[ "$BASH_VERSION" == 3.2.* ]]'
           env bash -c '[[ "$BASH_VERSION" == 3.2.* ]]'
       - name: bash -n parse under 3.2
+        if: matrix.shard == 1
         run: |
           set -euo pipefail
           files=$( { git ls-files -z bin thinkers tools tests contrib install.sh uninstall.sh status.sh | xargs -0 grep -lE '^#!.*\b(ba)?sh\b' ; git ls-files 'bin/*.sh' 'thinkers/*.sh' 'tools/*.sh' 'tests/*.sh'; } | sort -u)
@@ -194,6 +215,7 @@ jobs:
           for f in $files; do bash -n "$f" || { echo "::error file=$f::does not parse under bash 3.2"; rc=1; }; done
           exit $rc
       - name: Lint for bash-4-only constructs
+        if: matrix.shard == 1
         # Run-time failures on 3.2 that bash -n accepts: case-changing
         # expansions ${x^^} ${x,,}, ${x@Q}-style transforms, associative
         # arrays (declare -A), mapfile/readarray, coproc, |&, ;;&, &>>.
