@@ -4,6 +4,11 @@ This file is for coding agents (Claude Code, Cursor, and similar). It
 covers installing Headlong without a tty, checking that it is healthy, and
 the sharp edges that are not obvious from the code.
 
+Before you change or review code in this repository, read
+[CHARTER.md](CHARTER.md). It holds the maintainers' standing rules on
+architecture, security, and quality, and every change is checked against
+it.
+
 Naming: **Headlong** is the agent framework — identities, thinkers, the
 mind log, bridges, the dash. **shellm** is one tool inside it: the
 CLI implementation of Recursive Language Models in bash (`bin/shellm`),
