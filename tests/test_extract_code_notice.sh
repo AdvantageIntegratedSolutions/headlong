@@ -285,6 +285,63 @@ else
     bad "large wrapped heredoc is preserved without sending the script through argv"
 fi
 
+# CRLF: a Windows line ending must not survive into the extracted code, and
+# must not stop the closing fence from being recognized.
+resp=$'```bash\r\necho crlf\r\n```\r\n'
+out=$(extract_code "$resp")
+if [[ "$out" == "echo crlf" ]]; then
+    ok "CRLF line endings are stripped from the extracted code"
+else
+    bad "CRLF line endings are stripped from the extracted code" "$(printf '%s' "$out" | cat -vet)"
+fi
+
+# Harness provenance lines ([served_by], [exit], [stdout], ...) pasted after a
+# fenceless reply are structure, not code. Cut at the first one so metadata is
+# never run as shell commands.
+resp=$'echo one\n[served_by]\nXiaomi\n[exit] 0\n[stdout]\nnoise'
+out=$(extract_code "$resp")
+if [[ "$out" == *"echo one"* && "$out" != *"Xiaomi"* && "$out" != *"noise"* ]]; then
+    ok "provenance trailer is cut from a fenceless reply"
+else
+    bad "provenance trailer is cut from a fenceless reply" "$(printf '%s' "$out" | head -c 160)"
+fi
+
+# The same words inside a fenced block are literal code and must survive.
+resp=$'```bash\necho before\n[exit] 1\necho after\n```'
+out=$(extract_code "$resp")
+if [[ "$out" == $'echo before\n[exit] 1\necho after' ]]; then
+    ok "provenance text inside a fence is literal code"
+else
+    bad "provenance text inside a fence is literal code" "$out"
+fi
+
+# A provenance word inside an unfenced heredoc or multiline quote is data.
+# Compare all output, including the trailing command, and write the heredoc
+# to a file so truncating its contents cannot look like a successful run.
+for marker in served_by exec_s exit stdout stderr; do
+    for quoting in heredoc single double; do
+        case "$quoting" in
+            heredoc) script=$(printf "cat <<'DATA' > '%s/literal'\nbefore\n[%s]\nafter\nDATA\ncat '%s/literal'\necho AFTER\n" "$WORK" "$marker" "$WORK") ;;
+            single) script=$(printf "printf '%%s\\\\n' 'before\n[%s]\nafter'\necho AFTER\n" "$marker") ;;
+            double) script=$(printf "printf '%%s\\\\n' \"before\n[%s]\nafter\"\necho AFTER\n" "$marker") ;;
+        esac
+        expected=$(printf '%s\n' "$script" | bash)
+        out=$(extract_code "$script")
+        ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice"); rc=$?
+        if [[ "$rc" -eq 0 && "$ran" == "$expected" ]]; then
+            ok "unfenced $quoting preserves [$marker] and the trailing command"
+        else
+            bad "unfenced $quoting preserves [$marker] and the trailing command" "rc=$rc ran=$ran"
+        fi
+    done
+done
+
+# A large discarded trailer must not make the upstream printf die on SIGPIPE.
+resp=$'echo one\n[stdout]\n'"$padding"
+out=$(extract_code "$resp")
+ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice")
+[[ "$ran" == one ]] && ok "a large provenance trailer is discarded" || bad "a large provenance trailer is discarded" "$ran"
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]
