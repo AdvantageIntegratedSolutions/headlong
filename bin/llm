@@ -337,6 +337,7 @@ Environment:
                            precedence, and a value that disagrees with the
                            name warns on stderr
   LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
+  LLM_PROMPT_CACHE         0 turns off Anthropic prompt caching (default: on)
   LLM_RETRIES              Retries for transient API failures (default: 2;
                            0 disables). Never retries after partial output.
   LLM_RETRY_BACKOFF        Backoff base seconds between retries (default: 1)
@@ -695,6 +696,14 @@ build_payload_anthropic() {
         jq_filter="${jq_filter%\}} , output_config:{effort:\"$LLM_EFFORT\"}}"
     fi
 
+    # Automatic prompt caching: the API puts the breakpoint on the last block.
+    # shellm resends the whole run on every call, so each call after the first
+    # reads that prefix at a tenth of the input price. Anthropic only: Zen
+    # shares this builder and is not known to accept the field.
+    if [[ "$LLM_PROVIDER" == anthropic && "${LLM_PROMPT_CACHE:-1}" != 0 ]]; then
+        jq_filter="${jq_filter%\}} , cache_control:{type:\"ephemeral\"}}"
+    fi
+
     printf '%s' "$LLM_MESSAGES" | jq "${jq_args[@]}" "$jq_filter"
 }
 
@@ -1012,7 +1021,10 @@ warn_truncated() {
 # served from its prompt cache (OpenAI/OpenRouter prompt_tokens_details.
 # cached_tokens, Anthropic cache_read_input_tokens, Gemini
 # cachedContentTokenCount); it is billed at the cached rate, so the prefix
-# cache hit rate is cache_tok / in_tok.
+# cache hit rate is cache_tok / in_tok. For Anthropic, whose input_tokens
+# leaves out cached tokens, in_tok is the whole prompt (uncached + written +
+# read), and a sixth arg records cache_write_tok, the part written to the
+# cache at 1.25x the input price.
 # A fifth arg "estimated" marks a record derived from bytes rather than the
 # provider's count (the stream was cut before the usage event arrived).
 # The record also carries served_by (the upstream host OpenRouter routed the
@@ -1023,13 +1035,14 @@ warn_truncated() {
 _llm_served_by=""
 _llm_truncated=0
 write_usage() {
-    jq -nc --arg i "${1:-}" --arg o "${2:-}" --arg t "${3:-}" --arg c "${4:-}" --arg e "${5:-}" \
+    jq -nc --arg i "${1:-}" --arg o "${2:-}" --arg t "${3:-}" --arg c "${4:-}" --arg e "${5:-}" --arg w "${6:-}" \
         --arg p "$_llm_served_by" --arg tr "$_llm_truncated" '
         {}
         + (if ($i | test("^[0-9]+$")) then {in_tok: ($i | tonumber)} else {} end)
         + (if ($o | test("^[0-9]+$")) then {out_tok: ($o | tonumber)} else {} end)
         + (if ($t | test("^[0-9]+$")) then {think_tok: ($t | tonumber)} else {} end)
         + (if ($c | test("^[0-9]+$")) then {cache_tok: ($c | tonumber)} else {} end)
+        + (if ($w | test("^[0-9]+$")) then {cache_write_tok: ($w | tonumber)} else {} end)
         + (if $e == "estimated" then {estimated: true} else {} end)
         + (if $p != "" then {served_by: $p} else {} end)
         + (if $tr == "1" then {truncated: true} else {} end)' \
@@ -1042,7 +1055,7 @@ write_usage() {
 #   $_llm_home/usage/llm.jsonl      otherwise (hand calls)
 # LLM_USAGE_LEDGER overrides the path (/dev/null disables).
 #   {"ts":...,"provider":...,"model":...,"in_tok":N,"out_tok":N,"think_tok":N,
-#    "cache_tok":N,"served_by":...,"truncated":true,"identity":...,"run_id":...}
+#    "cache_tok":N,"cache_write_tok":N,"served_by":...,"truncated":true,"identity":...,"run_id":...}
 # identity/run_id are present only when known; cache_tok only when the
 # provider reported cached input tokens; served_by only on OpenRouter (the
 # upstream host); truncated only when the output hit max_tokens. The dash usage page and
@@ -1118,9 +1131,13 @@ stream_anthropic() {
                     _block=""
                     ;;
                 *'"message_start"'*)
-                    # Prompt size arrives up front on the start event.
-                    _u_in=$(printf '%s' "$json" | jq -r '.message.usage.input_tokens // empty' 2>/dev/null) || _u_in=""
-                    _u_cache=$(printf '%s' "$json" | jq -r '.message.usage.cache_read_input_tokens // empty' 2>/dev/null) || _u_cache=""
+                    # Prompt size arrives up front on the start event: whole
+                    # prompt, cache reads, cache writes (see write_usage).
+                    # "|", not a tab: read merges runs of tabs, so an empty
+                    # field would shift the next value into its slot.
+                    IFS='|' read -r _u_in _u_cache _u_cw < <(printf '%s' "$json" | jq -r '.message.usage
+                        | [(if .input_tokens == null then "" else .input_tokens + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0) end),
+                           (.cache_read_input_tokens // ""), (.cache_creation_input_tokens // "")] | map(tostring) | join("|")' 2>/dev/null) || true
                     ;;
                 *'"message_delta"'*)
                     if [[ "$(printf '%s' "$json" | jq -r '.delta.stop_reason // empty' 2>/dev/null)" == "max_tokens" ]]; then
@@ -1130,7 +1147,7 @@ stream_anthropic() {
                     # the previous, so the last delta wins.
                     if [[ "$json" == *'"output_tokens"'* ]]; then
                         _u_out=$(printf '%s' "$json" | jq -r '.usage.output_tokens // empty' 2>/dev/null) || _u_out=""
-                        [[ -n "$_u_out" ]] && write_usage "$_u_in" "$_u_out" "" "$_u_cache"
+                        [[ -n "$_u_out" ]] && write_usage "$_u_in" "$_u_out" "" "$_u_cache" "" "${_u_cw:-}"
                     fi
                     ;;
                 *'"type":"error"'*)
@@ -1545,13 +1562,17 @@ else
 
     case "$LLM_PROVIDER" in
         # opencode (Zen) speaks the Anthropic wire protocol, usage shape included.
-        anthropic|opencode) _u=$(jq -r '[(.usage.input_tokens // ""), (.usage.output_tokens // ""), "", (.usage.cache_read_input_tokens // "")] | @tsv' "$local_resp" 2>/dev/null) || _u="" ;;
-        gemini)    _u=$(jq -r '[(.usageMetadata.promptTokenCount // ""), (.usageMetadata.candidatesTokenCount // ""), (.usageMetadata.thoughtsTokenCount // ""), (.usageMetadata.cachedContentTokenCount // "")] | @tsv' "$local_resp" 2>/dev/null) || _u="" ;;
-        *)         _u=$(jq -r '[(.usage.prompt_tokens // ""), (.usage.completion_tokens // ""), (.usage.completion_tokens_details.reasoning_tokens // ""), (.usage.prompt_tokens_details.cached_tokens // "")] | @tsv' "$local_resp" 2>/dev/null) || _u="" ;;
+        anthropic|opencode) _u=$(jq -r '.usage
+            | [(if .input_tokens == null then "" else .input_tokens + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0) end),
+               (.output_tokens // ""), "", (.cache_read_input_tokens // ""), (.cache_creation_input_tokens // "")] | map(tostring) | join("|")' "$local_resp" 2>/dev/null) || _u="" ;;
+        gemini)    _u=$(jq -r '[(.usageMetadata.promptTokenCount // ""), (.usageMetadata.candidatesTokenCount // ""), (.usageMetadata.thoughtsTokenCount // ""), (.usageMetadata.cachedContentTokenCount // "")] | map(tostring) | join("|")' "$local_resp" 2>/dev/null) || _u="" ;;
+        *)         _u=$(jq -r '[(.usage.prompt_tokens // ""), (.usage.completion_tokens // ""), (.usage.completion_tokens_details.reasoning_tokens // ""), (.usage.prompt_tokens_details.cached_tokens // "")] | map(tostring) | join("|")' "$local_resp" 2>/dev/null) || _u="" ;;
     esac
     if [[ -n "$_u" ]]; then
-        IFS=$'\t' read -r _u_in _u_out _u_think _u_cache <<<"$_u"
-        write_usage "$_u_in" "$_u_out" "$_u_think" "$_u_cache"
+        # "|", not a tab: read merges runs of tabs, so an empty thinking
+        # count would shift the cached count into its slot.
+        IFS='|' read -r _u_in _u_out _u_think _u_cache _u_cw <<<"$_u"
+        write_usage "$_u_in" "$_u_out" "$_u_think" "$_u_cache" "" "${_u_cw:-}"
     fi
     _llm_ledger_append
 
