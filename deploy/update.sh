@@ -137,12 +137,20 @@ fi
 # dispatcher is untouched.
 # Keep the Slack bridge tokens out of the mind's env (deploy/split-bridge-env.sh;
 # idempotent, a no-op once split). Before the bridge restart below so the
-# bridge comes back reading .env.bridge.
+# bridge comes back reading /etc/shellm/slack.env.
 if [[ -f "$APP_DIR/deploy/split-bridge-env.sh" ]]; then
     sudo bash "$APP_DIR/deploy/split-bridge-env.sh" "$APP_DIR"
 fi
 if [[ -f /etc/systemd/system/headlong-slack-bridge.service ]]; then
     echo "==> Updating Slack bridge"
+    # Dedicated user, as for Telegram: the agent runs as shellm and can read
+    # the environment of any shellm process, tokens included. Group shellm
+    # grants read-only access to the identity's trajectory.
+    if ! id -u shellm-slack >/dev/null 2>&1; then
+        sudo useradd --system --no-create-home --shell /usr/sbin/nologin shellm-slack
+    fi
+    sudo usermod -aG shellm shellm-slack
+    sudo chmod g+rx "$SHELLM_HOME"
     for unit in headlong-slack-agent headlong-slack-bridge; do
         unit_src="$APP_DIR/deploy/$unit.service"
         if [[ -f "$unit_src" ]]; then

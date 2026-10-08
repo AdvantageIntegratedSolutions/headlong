@@ -38,7 +38,7 @@ if [ -n "$ENV_CONTENT" ]; then
     unset ENV_CONTENT
     echo "==> .env installed from SSM parameter ${env_parameter}"
     # The parameter holds the full file; the bridge tokens move to
-    # .env.bridge so the mind never sees them (deploy/split-bridge-env.sh).
+    # /etc/shellm/slack.env so the mind never sees them (deploy/split-bridge-env.sh).
     bash /opt/shellm/app/deploy/split-bridge-env.sh /opt/shellm/app || true
 else
     echo "==> WARNING: no value at SSM parameter ${env_parameter}; add keys manually"

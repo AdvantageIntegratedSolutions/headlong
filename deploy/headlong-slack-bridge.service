@@ -6,8 +6,25 @@
 #
 # Socket Mode: the bridge dials OUT to Slack over a websocket; nothing
 # listens. It talks to headlong-web on 127.0.0.1:8080 and tails the persona
-# identity's trajectory file directly. Config comes from the root .env
-# (SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SHELLM_SLACK_IDENTITY).
+# identity's trajectory file directly.
+#
+# Privilege separation, the same shape as headlong-telegram-bridge:
+#  - User=shellm-slack (NOT shellm): the agent runs as shellm and can
+#    read /proc/<pid>/environ of same-uid processes, so running the bridge
+#    as shellm would hand it the bot and app tokens. Moving the tokens to
+#    a separate file protects the file, not the process.
+#  - The tokens live in /etc/shellm/slack.env, root-owned mode 600;
+#    systemd reads it as root before dropping privileges
+#    (deploy/split-bridge-env.sh moves them there from the root .env).
+#  - StateDirectory (cursor + active threads) is owned by shellm-slack, so
+#    an injected agent cannot rewrite which threads the bridge follows.
+#  - SupplementaryGroups=shellm grants read access to the identity's
+#    trajectory under /opt/shellm (group r-x on the home dir). Read only:
+#    the bridge cannot append delivery notices, and says so once in its log
+#    (slack/src/headlong_slack/outbound.py), as the Telegram bridge does.
+#
+# ExecStart uses the project venv directly (not tools/headlong-slack-bridge):
+# uv would try to write the shellm-owned venv, which this user cannot.
 
 [Unit]
 Description=headlong Slack Socket Mode bridge
@@ -16,17 +33,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=shellm
+User=shellm-slack
+SupplementaryGroups=shellm
 WorkingDirectory=@SHELLM_HOME@/app
 # '-' prefix: missing .env (first boot, before the SSM fetch lands) must not
 # fail the unit — the bridge exits and Restart=always retries until it works.
+# Non-secret settings (SHELLM_SLACK_IDENTITY, SLACK_THREAD_FOLLOWUPS, ...)
+# stay in the root .env.
 EnvironmentFile=-@SHELLM_HOME@/app/.env
-# The bridge tokens live apart from the root .env so the mind never sees
-# them (deploy/split-bridge-env.sh); later files win, so a token still in
-# .env is overridden by .env.bridge.
-EnvironmentFile=-@SHELLM_HOME@/app/.env.bridge
-Environment="PATH=@SHELLM_HOME@/.local/bin:@SHELLM_HOME@/.bun/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=@SHELLM_HOME@/app/tools/headlong-slack-bridge @SHELLM_HOME@/app
+# Later files win, so a token still in .env is overridden here.
+EnvironmentFile=-/etc/shellm/slack.env
+StateDirectory=shellm-slack
+Environment="HOME=/var/lib/shellm-slack"
+Environment="HEADLONG_SLACK_STATE_DIR=/var/lib/shellm-slack"
+ExecStart=@SHELLM_HOME@/app/slack/.venv/bin/headlong-slack-bridge @SHELLM_HOME@/app
 Restart=always
 RestartSec=5
 # Default KillMode is fine: the bridge spawns no agent processes.

@@ -51,13 +51,16 @@ namespace, not checks in the tools. The mind keeps full sovereignty
 over its own identity directory; contributions to the runtime go
 through its clone and pull requests.
 
-The Slack bridge's tokens live in `.env.bridge`, loaded by
-`headlong-slack-bridge.service` only and marked inaccessible in the
-sandbox, so a wake cannot read them (`deploy/split-bridge-env.sh` moves
-them there; the box user data and `update.sh` run it, so a rebuild or a
-re-pushed `.env` lands in the same place). Telegram already had this
-shape: its token is root-owned in `/etc/shellm/telegram.env` and the
-bridge runs as a separate user. The box alert scripts post with
+The Slack bridge's tokens live in `/etc/shellm/slack.env`, root owned
+with mode 600, and only systemd reads it (`deploy/split-bridge-env.sh`
+moves them there; the box user data and `update.sh` run it, so a rebuild
+or a re-pushed `.env` lands in the same place). The bridge runs as its
+own user (`shellm-slack`), because a file the agent cannot read is not
+enough: processes with the same uid can read each other's environment,
+so a bridge running as `shellm` would hand the agent its tokens through
+`/proc/<pid>/environ`. This is the shape Telegram already had. Like the
+Telegram bridge, it reads the trajectory but cannot write it, so it
+writes no delivery notices. The box alert scripts post with
 `HEADLONG_ALERT_TOKEN` from the root `.env`; the split seeds it as a
 copy of the bot token so alerts keep working, and the split is only
 complete once that is replaced with a token from a dedicated alert-only

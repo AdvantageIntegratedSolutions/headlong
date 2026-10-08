@@ -56,7 +56,8 @@ runs its own Slack-connected agent on.
 
 Other settings: `HEADLONG_SLACK_STATE_DIR`, legacy `SHELLM_SLACK_STATE_DIR`
 (cursor + thread state, default
-`<identity>/run/slack-bridge/`), `SLACK_THREAD_FOLLOWUPS=1` (answer
+`<identity>/run/slack-bridge/`; the deployed unit sets it to
+`/var/lib/shellm-slack`, owned by the bridge's own user), `SLACK_THREAD_FOLLOWUPS=1` (answer
 un-mentioned replies in threads the bot is already part of),
 `SLACK_THREAD_JOIN_BACKFILL` (how many closest prior messages above a first @mention
 to prepend; default 20, 0 disables, max 50), and peer hearing:

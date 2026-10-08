@@ -152,6 +152,14 @@ augenrules --load || echo "WARN: augenrules --load failed — audit rules apply 
 # set (the terraform-slack stack sets it in user_data).
 if [[ "${SHELLM_INSTALL_SLACK_BRIDGE:-0}" == "1" ]]; then
     echo "==> Installing Slack bridge (SHELLM_INSTALL_SLACK_BRIDGE=1)"
+    # The bridge runs as its own user so the agent (shellm) cannot read its
+    # tokens out of /proc; see deploy/headlong-slack-bridge.service.
+    if ! id -u shellm-slack >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin shellm-slack
+    fi
+    usermod -aG "$SHELLM_USER" shellm-slack
+    chmod g+rx "$SHELLM_HOME"
+    bash "$SCRIPT_DIR/split-bridge-env.sh" "$APP_DIR"
     sudo -u "$SHELLM_USER" bash -c "
         export PATH=\"\$HOME/.local/bin:\$PATH\"
         cd '$APP_DIR/slack' && uv sync
