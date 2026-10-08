@@ -26,7 +26,9 @@ bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 WORK=$(mktemp -d)
 FN="$WORK/functions"
 trap 'rm -rf "$WORK"' EXIT
-sed -n '/^normalize_toolcall_markup() {/,/^}/p' "$REPO/bin/shellm" > "$FN"
+for fn in script_parses strip_markup_suffix normalize_toolcall_markup; do
+    sed -n "/^$fn() {/,/^}/p" "$REPO/bin/shellm"
+done > "$FN"
 sed -n '/^extract_code() {/,/^}/p' "$REPO/bin/shellm" >> "$FN"
 # shellcheck disable=SC1090
 source "$FN"
@@ -82,6 +84,65 @@ for shape in canonical hybrid bare parameter; do
         bad "tool-call markup ($shape) is lifted, runs, and carries the notice" "ran=$ran notice=$(cat "$WORK/notice" | head -c 120)"
     fi
     rm -f "$WORK/notice"
+done
+# MiMo shapes seen on Audel 2026-09-22 to 09-25: the tags inline on the first
+# and last code lines, other parameter names, a trailing one-line parameter,
+# and a prose sentence (apostrophes, backticks) before the markup.
+for shape in inline cmd_timeout prose_prefix prose_lines block; do
+    case "$shape" in
+        inline)       resp=$'<tool_call><function=bash><parameter=command>echo lifted-inline\necho second</parameter></function></tool_call>' ;;
+        cmd_timeout)  resp=$'<tool_call><function=bash><parameter=cmd>echo lifted-cmd_timeout</parameter>\n<parameter=timeout>30</parameter>\n</function></tool_call>' ;;
+        prose_prefix) resp=$'Let me look at the evidence first.<tool_call><function=bash><parameter=command>echo lifted-prose_prefix\n</parameter></function></tool_call>' ;;
+        prose_lines)  resp=$'I\'ll check the `mem add` syntax first.\n\nThat\'s the plan.<tool_call><function=bash><parameter=command>echo lifted-prose_lines</parameter></function></tool_call>' ;;
+        block)        resp=$'<tool_call>\n<function=bash>\n<parameter=block>echo lifted-block\n</parameter>\n</function>\n</tool_call>' ;;
+    esac
+    out=$(extract_code "$resp")
+    ran=$(bash -c "$out" 2>"$WORK/notice")
+    if [[ "$ran" == "lifted-$shape"* ]] && grep -q 'used <tool_call>/<function=bash> markup' "$WORK/notice"; then
+        ok "MiMo markup ($shape) is lifted, runs, and carries the notice"
+    else
+        bad "MiMo markup ($shape) is lifted, runs, and carries the notice" "ran=$ran out=$(head -c 160 <<<"$out")"
+    fi
+    rm -f "$WORK/notice"
+done
+# A stray fence glued to the markup ("```<tool_call>…" closed by a lone ```).
+resp=$'```<tool_call><function=bash><parameter=command>echo lifted-glued\n</parameter></function></tool_call>\n```'
+ran=$(bash -c "$(extract_code "$resp")" 2>/dev/null)
+[[ "$ran" == "lifted-glued" ]] && ok "a stray fence glued to the markup is lifted" || bad "a stray fence glued to the markup is lifted" "ran=$ran"
+# A real fence whose code ends in MiMo's closing tags: the suffix is stripped,
+# the script runs, and the model is told about the markup.
+for shape in inline_suffix tag_lines; do
+    case "$shape" in
+        inline_suffix) resp=$'Checking.\n```bash\nfor x in a; do\n  echo fenced-$x\ndone</parameter></function></tool_call>\n```' ;;
+        tag_lines)     resp=$'```bash\necho fenced-a\n</parameter>\n</function>\n</tool_call>\n```' ;;
+    esac
+    out=$(extract_code "$resp")
+    ran=$(bash -c "$out" 2>"$WORK/notice")
+    if [[ "$ran" == "fenced-a" ]] && grep -q 'used <tool_call>' "$WORK/notice"; then
+        ok "fenced code ending in closing tags ($shape) is repaired and runs"
+    else
+        bad "fenced code ending in closing tags ($shape) is repaired and runs" "ran=$ran"
+    fi
+    rm -f "$WORK/notice"
+done
+# A fenced script that is valid as written keeps a trailing literal tag.
+resp=$'```bash\ncat <<\'EOF\'\n</tool_call>\nEOF\n```'
+out=$(extract_code "$resp")
+[[ "$(bash -c "$out" 2>/dev/null)" == "</tool_call>" && "$out" != *"used <tool_call>"* ]] &&
+    ok "a valid fenced script keeps its literal closing tag" || bad "a valid fenced script keeps its literal closing tag" "$out"
+# A prefix that is shell code, or an open quote before the markup, is data.
+for shape in shell_prefix backslash_prefix open_quote; do
+    case "$shape" in
+        shell_prefix) resp=$'x=1; echo done.<tool_call><function=bash><parameter=command>echo DATA\n</parameter></function></tool_call>' ;;
+        backslash_prefix) resp=$'printf a\\\\b.<tool_call><function=bash><parameter=command>echo DATA\n</parameter></function></tool_call>' ;;
+        open_quote)   resp=$'echo \'intro\n<tool_call>\necho DATA\n</tool_call>\'' ;;
+    esac
+    out=$(normalize_toolcall_markup "$resp"); rc=$?
+    if [[ "$rc" -eq 1 && "$out" == "$resp" ]]; then
+        ok "inline markup after shell code ($shape) is left unchanged"
+    else
+        bad "inline markup after shell code ($shape) is left unchanged" "rc=$rc"
+    fi
 done
 out=$(extract_code $'<tool_call> mentioned in prose\n```bash\necho fence-wins\n```')
 if [[ "$(bash -c "$out" 2>/dev/null)" == "fence-wins" ]] && [[ "$out" != *"used <tool_call>"* ]]; then
@@ -146,7 +207,7 @@ done
 
 # Ambiguous or incomplete scripts must be returned unchanged. bash -n alone
 # is insufficient: an unterminated heredoc warns but exits successfully.
-for shape in quote heredoc tag_delimiter preamble unknown_tool extra_call; do
+for shape in quote heredoc tag_delimiter preamble unknown_tool; do
     case "$shape" in
         quote) resp=$'<tool_call>\nprintf "%s\\n" "unfinished\n</tool_call>' ;;
         heredoc) resp=$'<tool_call>\ncat <<EOF\nunfinished\n</tool_call>' ;;
@@ -160,7 +221,6 @@ SCRIPT
 ) ;;
         preamble) resp=$'cat <<EOF\n<tool_call>\necho DATA_ONLY\n</tool_call>' ;;
         unknown_tool) resp=$'<tool_call>\n<function=python>\nprint("hello")\n</function>\n</tool_call>' ;;
-        extra_call) resp=$'<tool_call>\necho first\n</tool_call>\n<tool_call>\necho second\n</tool_call>' ;;
     esac
     out=$(normalize_toolcall_markup "$resp"); rc=$?
     if [[ "$rc" -eq 1 && "$out" == "$resp" ]]; then
@@ -169,6 +229,30 @@ SCRIPT
         bad "ambiguous markup ($shape) is left unchanged" "rc=$rc"
     fi
 done
+
+# Several calls in one reply: only the first runs, as with fenced blocks, and
+# the model is told the rest was dropped. A cut that lands inside a heredoc
+# does not parse, so that reply falls back to lifting the whole body.
+for shape in extra_call mimo_two mimo_sameline; do
+    case "$shape" in
+        extra_call) resp=$'<tool_call>\necho first\n</tool_call>\n<tool_call>\necho second\n</tool_call>' ;;
+        mimo_two)   resp=$'Two checks.<tool_call><function=bash><parameter=command>echo first</parameter></function></tool_call>\n<tool_call><function=bash><parameter=command>echo second</parameter></function></tool_call>' ;;
+        mimo_sameline) resp=$'<tool_call><function=bash><parameter=command>echo first</parameter></function></tool_call><tool_call><function=bash><parameter=command>echo second</parameter></function></tool_call>' ;;
+    esac
+    out=$(extract_code "$resp")
+    ran=$(bash -c "$out" 2>"$WORK/notice")
+    if [[ "$ran" == "first" ]] && grep -q 'truncated after first code block' "$WORK/notice" &&
+        grep -q 'used <tool_call>' "$WORK/notice"; then
+        ok "multiple calls ($shape): only the first runs, with both notices"
+    else
+        bad "multiple calls ($shape): only the first runs, with both notices" "ran=$ran notice=$(head -c 200 "$WORK/notice")"
+    fi
+    rm -f "$WORK/notice"
+done
+resp=$'<tool_call>\n<function=bash>\ncat <<\'DATA\'\n</tool_call>\n<tool_call>\nDATA\necho AFTER\n</function>\n</tool_call>'
+ran=$(bash -c "$(extract_code "$resp")" 2>/dev/null)
+[[ "$ran" == $'</tool_call>\n<tool_call>\nAFTER' ]] && ok "a call boundary inside a heredoc is data, not a cut" ||
+    bad "a call boundary inside a heredoc is data, not a cut" "ran=$ran"
 
 # A fence must win even when grep sees it before printf has finished writing.
 # Use multiline padding well beyond pipe capacity and repeat under pipefail.
@@ -200,6 +284,63 @@ if [[ "$ran" == "$expected" && "$out" == *"used <tool_call>"* ]]; then
 else
     bad "large wrapped heredoc is preserved without sending the script through argv"
 fi
+
+# CRLF: a Windows line ending must not survive into the extracted code, and
+# must not stop the closing fence from being recognized.
+resp=$'```bash\r\necho crlf\r\n```\r\n'
+out=$(extract_code "$resp")
+if [[ "$out" == "echo crlf" ]]; then
+    ok "CRLF line endings are stripped from the extracted code"
+else
+    bad "CRLF line endings are stripped from the extracted code" "$(printf '%s' "$out" | cat -vet)"
+fi
+
+# Harness provenance lines ([served_by], [exit], [stdout], ...) pasted after a
+# fenceless reply are structure, not code. Cut at the first one so metadata is
+# never run as shell commands.
+resp=$'echo one\n[served_by]\nXiaomi\n[exit] 0\n[stdout]\nnoise'
+out=$(extract_code "$resp")
+if [[ "$out" == *"echo one"* && "$out" != *"Xiaomi"* && "$out" != *"noise"* ]]; then
+    ok "provenance trailer is cut from a fenceless reply"
+else
+    bad "provenance trailer is cut from a fenceless reply" "$(printf '%s' "$out" | head -c 160)"
+fi
+
+# The same words inside a fenced block are literal code and must survive.
+resp=$'```bash\necho before\n[exit] 1\necho after\n```'
+out=$(extract_code "$resp")
+if [[ "$out" == $'echo before\n[exit] 1\necho after' ]]; then
+    ok "provenance text inside a fence is literal code"
+else
+    bad "provenance text inside a fence is literal code" "$out"
+fi
+
+# A provenance word inside an unfenced heredoc or multiline quote is data.
+# Compare all output, including the trailing command, and write the heredoc
+# to a file so truncating its contents cannot look like a successful run.
+for marker in served_by exec_s exit stdout stderr; do
+    for quoting in heredoc single double; do
+        case "$quoting" in
+            heredoc) script=$(printf "cat <<'DATA' > '%s/literal'\nbefore\n[%s]\nafter\nDATA\ncat '%s/literal'\necho AFTER\n" "$WORK" "$marker" "$WORK") ;;
+            single) script=$(printf "printf '%%s\\\\n' 'before\n[%s]\nafter'\necho AFTER\n" "$marker") ;;
+            double) script=$(printf "printf '%%s\\\\n' \"before\n[%s]\nafter\"\necho AFTER\n" "$marker") ;;
+        esac
+        expected=$(printf '%s\n' "$script" | bash)
+        out=$(extract_code "$script")
+        ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice"); rc=$?
+        if [[ "$rc" -eq 0 && "$ran" == "$expected" ]]; then
+            ok "unfenced $quoting preserves [$marker] and the trailing command"
+        else
+            bad "unfenced $quoting preserves [$marker] and the trailing command" "rc=$rc ran=$ran"
+        fi
+    done
+done
+
+# A large discarded trailer must not make the upstream printf die on SIGPIPE.
+resp=$'echo one\n[stdout]\n'"$padding"
+out=$(extract_code "$resp")
+ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice")
+[[ "$ran" == one ]] && ok "a large provenance trailer is discarded" || bad "a large provenance trailer is discarded" "$ran"
 
 echo
 echo "$pass passed, $fail failed"

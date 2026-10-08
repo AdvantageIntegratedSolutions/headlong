@@ -112,5 +112,31 @@ for limit in 0 104857600; do
     fi
 done
 
+# --- a heartbeat that never ends is killed at SHELLM_MAX_EXEC_TIME -----------
+# The output stays tiny and never goes quiet, so only the wall-clock guard can
+# stop it (Audel 2026-09-25: a scan blocked on a fifo behind an echo loop).
+fence 'echo $$ > producer.pid; while :; do echo "... waiting"; sleep 1; done' > "$WORK/script/1"
+SHELLM_MAX_EXEC_TIME=3 SHELLM_INACTIVITY_TIMEOUT=600 SHELLM_INACTIVITY_MAX=600 \
+    run_shellm "heartbeat case"
+
+if grep -q 'shellm-watchdog\] wall timeout' "$WORK/err"; then
+    ok "endless heartbeat is killed at SHELLM_MAX_EXEC_TIME"
+else
+    bad "endless heartbeat is killed at SHELLM_MAX_EXEC_TIME" "$(tail -3 "$WORK/err")"
+fi
+wall_traj=("$HEADLONG_HOME/trajectories"/*heartbeat-case/trajectory.jsonl)
+if grep -q 'the limit for one block' "${wall_traj[@]}" 2>/dev/null; then
+    ok "kill feedback names the wall-clock cause"
+else
+    bad "kill feedback names the wall-clock cause"
+fi
+producer=$(cat "$WORK/wd/producer.pid" 2>/dev/null || echo 0)
+if [[ "$producer" -gt 1 ]] && ! kill -0 "$producer" 2>/dev/null && grep -qx 'done' "$WORK/out"; then
+    ok "heartbeat producer is gone before shellm returns"
+else
+    bad "heartbeat producer is gone before shellm returns"
+    [[ "$producer" -gt 1 ]] && kill "$producer" 2>/dev/null || true
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

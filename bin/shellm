@@ -149,6 +149,11 @@ SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
 # actively producing output (a runaway loop resets the inactivity counter every
 # check, so silence-based watchdogs never catch it). 0 disables the guard.
 SHELLM_MAX_OUTPUT_SIZE="${SHELLM_MAX_OUTPUT_SIZE:-104857600}"
+# Kill a block that has run this many seconds, however it behaves. A command
+# that prints a heartbeat while it waits on something that never finishes
+# passes every other guard (Audel 2026-09-25: a scan blocked 3.5 h reading a
+# fifo behind an `echo; sleep 5` loop). 0 disables the guard.
+SHELLM_MAX_EXEC_TIME="${SHELLM_MAX_EXEC_TIME:-3600}"
 SHELLM_BEACON_INTERVAL="${SHELLM_BEACON_INTERVAL:-5}"
 VERBOSE=0
 QUIET=0
@@ -355,6 +360,8 @@ Environment:
                           has a live nested shellm run (default: 900)
   SHELLM_MAX_OUTPUT_SIZE  Bytes of output before killing a command that keeps
                           producing output (default: 104857600; 0 disables)
+  SHELLM_MAX_EXEC_TIME    Seconds before killing a block no matter what it is
+                          doing (default: 3600; 0 disables)
   SHELLM_BEACON_INTERVAL  Seconds between activity beacon touches (default: 5)
   SHELLM_WORKDIR          (Internal) Working directory for current run
 
@@ -421,7 +428,8 @@ redact_sensitive() {
 extract_reasoning() {
     local response="$1"
     printf '%s\n' "$response" | awk '
-        # Stop at the opening code fence — everything before it is reasoning.
+        # Emit only the text before the opening code fence. Keep reading after
+        # it so a large response cannot give printf SIGPIPE under pipefail.
         # The fence may be a lone ``` line OR a tagged ```bash/```sh appended
         # to the end of a prose sentence (some models, e.g. grok, do the
         # latter). In the appended case, emit the prose that precedes the fence
@@ -429,12 +437,14 @@ extract_reasoning() {
         # Bare and shell-tagged line-start fences end the reasoning, trailing
         # text included; a non-shell fence (```json etc.) does NOT — a model
         # showing a JSON example mid-reasoning keeps its subsequent prose.
-        /^```(bash|shell|sh)?([[:space:]].*)?$/ { exit }
+        in_code { next }
+        /^```(bash|shell|sh)?([[:space:]].*)?$/ { in_code = 1; next }
         match($0, /```(bash|shell|sh)[[:space:]]*$/) {
             pre = substr($0, 1, RSTART - 1)
             sub(/[[:space:]]+$/, "", pre)
             if (pre ~ /[^[:space:]]/) print pre
-            exit
+            in_code = 1
+            next
         }
         { print }
     '
@@ -536,6 +546,17 @@ build_inactivity_feedback() {
 
     # A runaway command that kept producing output was not idle and not at a
     # prompt, so none of the interactive/nested advice below applies.
+    if [[ "$reason" == "wall" ]]; then
+        printf 'Execution was KILLED after running for %s seconds, the limit for one block\n' "$timeout"
+        printf '(it was still producing output, so something in it was waiting forever or\n'
+        printf 'the work is too big for one block).\n'
+        printf '\nLast output before the kill:\n%s\n' "$last_output"
+        printf '\nCheck what the block was waiting on (a pipe, a fifo, a lock, the network)\n'
+        printf 'and bound it with timeout. Split long work across steps: start it in the\n'
+        printf 'background with output in a file, then check the file in a later step.\n'
+        return 0
+    fi
+
     if [[ "$reason" == "output" ]]; then
         printf 'Execution was KILLED after its output grew past %s bytes\n' "$timeout"
         printf '(a command producing unbounded output, e.g. an infinite loop).\n'
@@ -1525,13 +1546,14 @@ _kill_exec_tree() {
 # been killed and the direct child reaped. A Docker supervisor publishes its PID
 # so the host can cancel inside the container, not just disconnect its client.
 _supervise_exec() {
-    local code="$1" control_dir="${2:-}" child="" rc=0
+    local code="$1" control_dir="${2:-}" child="" rc=0 code_file=""
     _terminate_exec() {
         trap '' TERM INT HUP
         if [[ -n "$child" ]]; then
             _kill_exec_tree "$child"
             wait "$child" 2>/dev/null || true
         fi
+        [[ -z "$code_file" ]] || rm -f "$code_file"
         exit 143
     }
     trap _terminate_exec TERM INT HUP
@@ -1539,9 +1561,28 @@ _supervise_exec() {
         mkdir -m 700 "$control_dir" || return 1
         printf '%s\n' "$$" > "$control_dir/pid"
     fi
-    bash -e -c "$code" </dev/null &
+    # A generated code block can exceed the kernel's per-argument cap
+    # (MAX_ARG_STRLEN, 128KB on Linux). Handing it to `bash -c "$code"` then
+    # fails the exec itself: rc=126 "Argument list too long", the step never
+    # runs, and the wake dies with nothing durable (live 2026-09-26). Above
+    # the threshold, run bash on a script file instead of an argv string.
+    # The mktemp file is mode 600, stricter than an argv string, which any
+    # user can read through ps. Size is measured in bytes: ${#code} counts
+    # characters, so multibyte UTF-8 code could slip past the cap.
+    local code_bytes
+    code_bytes=$(printf '%s' "$code" | wc -c)
+    if [[ "$code_bytes" -gt 65536 ]]; then
+        # Docker cancellation kills the supervisor too; its control directory
+        # is removed by the host afterward, including this script.
+        code_file=$(mktemp "${control_dir:-${TMPDIR:-/tmp}}/shellm-code.XXXXXX") || return 1
+        printf '%s' "$code" > "$code_file"
+        bash -e "$code_file" </dev/null &
+    else
+        bash -e -c "$code" </dev/null &
+    fi
     child=$!
     wait "$child" || rc=$?
+    [[ -z "$code_file" ]] || rm -f "$code_file"
     trap - TERM INT HUP
     return "$rc"
 }
@@ -1601,9 +1642,12 @@ execute_code() {
         }
         trap _terminate_docker_exec TERM INT HUP
         if [[ ${#exports[@]} -gt 0 ]]; then export "${exports[@]}"; fi
-        docker exec "${docker_env_flags[@]}" -w "$workspace" \
+        # The Docker client also has an argv limit, before the remote
+        # supervisor can move large code to a script. Send code over stdin;
+        # _supervise_exec still gives generated commands /dev/null for stdin.
+        docker exec -i "${docker_env_flags[@]}" -w "$workspace" \
             "$_SHELLM_CONTAINER" bash -c "$(declare -f _kill_exec_tree _supervise_exec)
-_supervise_exec \"\$@\"" _ "$wrapped_code" "$control_dir" </dev/null 2>&1 &
+_supervise_exec \"\$(cat)\" \"\$1\"" _ "$control_dir" <<< "$wrapped_code" 2>&1 &
         client=$!
         wait "$client" || rc=$?
         trap - TERM INT HUP
@@ -1703,6 +1747,36 @@ call_llm() {
 # Code extraction from LLM response
 # ---------------------------------------------------------------------------
 
+# script_parses SCRIPT — true when SCRIPT is complete, valid bash. Never runs
+# model code or startup files. Bash 3.2 silently accepts an unclosed heredoc
+# under -n, so an unmatched ) is appended too: if that also parses, the
+# trailer was swallowed as heredoc data and the script is incomplete.
+script_parses() {
+    local diagnostics
+    diagnostics=$(printf '%s\n' "$1" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>&1) &&
+        [[ -z "$diagnostics" ]] &&
+        ! { printf '%s\n)\n' "$1" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>/dev/null; }
+}
+
+# strip_markup_suffix — drop tool-call closing markup from the END of a script
+# on stdin: closing-tag lines, one-line extra parameters
+# (<parameter=timeout>30</parameter>), then the closing tags that end the last
+# code line. Only the suffix: a closing tag inside a heredoc or quoted string
+# earlier in the script is literal data.
+strip_markup_suffix() {
+    awk '
+        function blank(s) { return s ~ /^[[:space:]]*$/ }
+        { lines[++n] = $0 }
+        END {
+            close_run = "(<\\/(tool_call|function|parameter|bash|invoke|function_calls)>[[:space:]]*)+$"
+            while (n > 0 && (blank(lines[n]) || lines[n] ~ ("^[[:space:]]*" close_run) ||
+                            lines[n] ~ /^[[:space:]]*<parameter=[A-Za-z_]+>[^<]*<\/parameter>[[:space:]]*$/)) n--
+            if (n > 0 && sub(close_run, "", lines[n]))
+                while (n > 0 && blank(lines[n])) n--
+            for (i = 1; i <= n; i++) print lines[i]
+        }'
+}
+
 # normalize_toolcall_markup RESPONSE — Qwen-family models sometimes answer in
 # their native tool-call markup instead of a fence:
 #   <tool_call>            <tool_call>              <tool_call>
@@ -1712,60 +1786,111 @@ call_llm() {
 #   </tool_call>           </parameter> …
 # (also the hybrid "<function=bash> … </bash>"). Run as-is, the first line is a
 # bash syntax error and the whole turn is wasted (4 of 46 responses on Custos,
-# 2026-09-09). When a response has NO fence but does have this markup, lift
-# the code inside the outer tags into a ```bash fence so it executes, and
-# tell the model on stderr what happened so it learns the fence. Real fences
-# win. Ambiguous wrappers are left alone rather than risking script data
-# becoming commands.
+# 2026-09-09). MiMo writes the same markup inline: the opening tags lead the
+# first code line and the closing tags end the last one, with the command
+# parameter named command, cmd or code, sometimes followed by a one-line
+# <parameter=timeout>…</parameter> (1,642 of 3,272 Audel replies, 09-22 to
+# 09-25, none lifted before). When a response has NO fence but does have this
+# markup, lift the code inside the outer tags into a ```bash fence so it
+# executes, and tell the model on stderr what happened so it learns the
+# fence. Real fences win. Ambiguous wrappers are left alone rather than
+# risking script data becoming commands. Returns 0 when lifted, 2 when lifted
+# but later calls were dropped, 1 when the response is returned unchanged.
 normalize_toolcall_markup() {
-    local response="$1"
+    local response="$1" markup="$1"
     case "$response" in
         *"<tool_call>"*|*"<function="*|*"<bash>"*) ;;
         *) printf '%s' "$response"; return 1 ;;
     esac
+    # MiMo sometimes glues a stray fence to the markup ("```<tool_call>…",
+    # closed by a lone ``` line). That is markup, not a fence: drop the two
+    # fence marks, but only when no real fence comes before it.
+    case "$markup" in
+        *'```<tool_call>'*|*'```<function=bash>'*)
+            markup=$(printf '%s\n' "$markup" | awk '
+                !seen && /^```<(tool_call|function=bash)>/ { sub(/^```/, ""); glued = 1 }
+                /^```/ { seen = 1 }
+                { lines[++n] = $0 }
+                END {
+                    while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+                    if (glued && n > 0 && lines[n] ~ /^```[[:space:]]*$/) n--
+                    for (i = 1; i <= n; i++) print lines[i]
+                }') ;;
+    esac
     # Consume the whole response: grep -q can give printf SIGPIPE, making a
     # matching fence look absent under pipefail on larger responses.
-    if printf '%s\n' "$response" | grep -E '^```|```(bash|shell|sh)[[:space:]]*$' >/dev/null; then
+    if printf '%s\n' "$markup" | grep -E '^```|```(bash|shell|sh)[[:space:]]*$' >/dev/null; then
         printf '%s' "$response"; return 1
     fi
-    local lifted diagnostics
-    lifted=$(printf '%s\n' "$response" | awk -v sq="'" '
+    local body lifted first
+    body=$(printf '%s\n' "$markup" | awk -v sq="'" '
+        # Drop the run of opening tags that leads a line; what is left is code.
+        function strip_open(s) {
+            while (match(s, /^[[:space:]]*<(tool_call|function=bash|bash|parameter=(command|cmd|code|commands|script|block))>/))
+                s = substr(s, RSTART + RLENGTH)
+            return s
+        }
+        function blank(s) { return s ~ /^[[:space:]]*$/ }
+        # Shell syntax that means a line is code, not prose.
+        function shellish(s) { return s ~ /[<>|$;&=]/ || index(s, "\\") }
         BEGIN { started = 0; body = 0; ambiguous = 0; n = 0 }
+        # MiMo also appends the markup to a prose sentence on the same line
+        # ("…look at the evidence first.<tool_call><function=bash>…"). Accept
+        # that only when the prefix ends a sentence and has no shell syntax,
+        # so a quoted or redirected literal tag is never taken for markup.
+        !started && match($0, /<(tool_call|function=bash)>/) && RSTART > 1 {
+            pre = substr($0, 1, RSTART - 1)
+            if (pre ~ /[.:!?][[:space:]]*$/ && !shellish(pre)) $0 = substr($0, RSTART)
+        }
         !started {
-            if ($0 ~ /^[[:space:]]*<(tool_call|function=bash|bash)>[[:space:]]*$/) {
+            if ($0 ~ /^[[:space:]]*<(tool_call|function=bash|bash)>/) {
                 started = 1
-            } else if (index($0, sq) || $0 ~ /["`\\<>]/) {
+                rest = strip_open($0)
+                if (!blank(rest)) { body = 1; lines[++n] = rest }
+            } else if ((index($0, sq) || $0 ~ /["`\\<>]/) &&
+                       !($0 ~ /[.:!?)][[:space:]]*$/ && !shellish($0))) {
                 # Permit simple prose before the wrapper, but never scan past
                 # a quote, continuation, or redirection into possible data.
+                # A finished sentence with no shell syntax is prose even when
+                # it has an apostrophe or a `backticked` word.
                 ambiguous = 1
             }
             next
         }
         !body {
-            if ($0 ~ /^[[:space:]]*<(function=bash|parameter=command|bash)>[[:space:]]*$/ ||
-                $0 ~ /^[[:space:]]*$/) next
+            rest = strip_open($0)
+            if (blank(rest)) next
             body = 1
+            lines[++n] = rest
+            next
         }
         { lines[++n] = $0 }
         END {
             if (ambiguous || !started) exit
-            # Strip only the suffix, not tags within the script. In particular,
-            # a closing tag inside a heredoc or quoted string is literal data.
-            while (n > 0 && (lines[n] ~ /^[[:space:]]*<\/(tool_call|function|parameter|bash)>[[:space:]]*$/ ||
-                            lines[n] ~ /^[[:space:]]*$/)) n--
             for (i = 1; i <= n; i++) print lines[i]
         }')
-    if [[ "$lifted" =~ [^[:space:]] ]]; then
-        # Reject syntax errors without executing model code or startup files.
-        # Bash 3.2 silently accepts an unclosed heredoc under -n. Appending an
-        # unmatched ) must fail: if it succeeds, the trailer was swallowed as
-        # heredoc data and the candidate is incomplete. Newer bash warns too.
-        if diagnostics=$(printf '%s\n' "$lifted" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>&1) &&
-            [[ -z "$diagnostics" ]] &&
-            ! { printf '%s\n)\n' "$lifted" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>/dev/null; }; then
-            printf '%s' $'```bash\n'"$lifted"$'\n```'
-            return 0
-        fi
+    # Several calls in one reply: run only the first, as with fenced blocks,
+    # and return 2 so extract_code tells the model the rest was dropped. The
+    # first call ends at the first line closing a call, and only counts when
+    # another call opens after it and the first parses on its own; a cut
+    # inside a heredoc or quoted string never parses.
+    # MiMo usually opens the next call on the same line the last one closes.
+    first=$(printf '%s\n' "$body" | awk '
+        !cut && match($0, /<\/(function|tool_call)>[[:space:]]*<(tool_call|function=bash)>/) {
+            l[++n] = substr($0, 1, RSTART - 1); cut = n; more = 1; next
+        }
+        { l[++n] = $0 }
+        !cut && /<\/(function|tool_call)>[[:space:]]*$/ { cut = n; next }
+        cut && /^[[:space:]]*<(tool_call|function=bash)>/ { more = 1 }
+        END { if (cut && more) for (i = 1; i <= cut; i++) print l[i] }' | strip_markup_suffix)
+    if [[ "$first" =~ [^[:space:]] ]] && script_parses "$first"; then
+        printf '%s' $'```bash\n'"$first"$'\n```'
+        return 2
+    fi
+    lifted=$(printf '%s\n' "$body" | strip_markup_suffix)
+    if [[ "$lifted" =~ [^[:space:]] ]] && script_parses "$lifted"; then
+        printf '%s' $'```bash\n'"$lifted"$'\n```'
+        return 0
     fi
     printf '%s' "$response"
     return 1
@@ -1774,10 +1899,12 @@ normalize_toolcall_markup() {
 extract_code() {
     local response="$1"
     local toolcall_lifted=0
-    local _normalized
-    if _normalized=$(normalize_toolcall_markup "$response"); then
+    local _normalized _rc calls_dropped=0
+    _rc=0; _normalized=$(normalize_toolcall_markup "$response") || _rc=$?
+    if [[ "$_rc" -ne 1 ]]; then
         response="$_normalized"
         toolcall_lifted=1
+        [[ "$_rc" -eq 2 ]] && calls_dropped=1
     fi
 
     # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
@@ -1822,6 +1949,9 @@ extract_code() {
         }
 
         BEGIN { in_block = 0; hd_top = 0; first_block_closed = 0 }
+        # CRLF input: a trailing \r would survive into the collected code
+        # and both break the closing-fence check and hand bash a bad line.
+        { sub(/\r$/, "", $0) }
 
         # After first block closed: look for another opening fence. A tagged
         # ```bash/```sh fence may be appended to the end of a prose line (see
@@ -1881,11 +2011,40 @@ extract_code() {
     truncation_signal=$(cat "$truncation_file" 2>/dev/null || true)
     rm -f "$truncation_file"
 
+    # MiMo often opens a real ```bash fence and still ends the code with its
+    # tool-call closing tags ("done</parameter></function></tool_call>"), a
+    # syntax error that killed 263 fenced replies on Audel (09-22 to 09-25).
+    # Strip that suffix only when it turns a broken script into a valid one.
+    if [[ "$toolcall_lifted" -eq 0 && "$code" == *"</"* ]]; then
+        local _trimmed
+        _trimmed=$(printf '%s\n' "$code" | strip_markup_suffix)
+        if [[ "$_trimmed" != "$code" && "$_trimmed" =~ [^[:space:]] ]] &&
+            ! script_parses "$code" && script_parses "$_trimmed"; then
+            code="$_trimmed"
+            toolcall_lifted=1
+        fi
+    fi
+
     # If no fenced blocks at all, use the whole response as code.
     # Strip [cmd]/[thought] markers that the model may emit instead of fences.
     local no_fence=0
     if [[ -z "$code" ]]; then
-        code=$(printf '%s\n' "$response" | sed '/^[[:space:]]*\[cmd\][[:space:]]*$/d; /^[[:space:]]*\[thought\]/d')
+        code=$(printf '%s\n' "$response" | awk '
+            /^[[:space:]]*\[cmd\][[:space:]]*$/ { next }
+            /^[[:space:]]*\[thought\]/ { next }
+            { print }
+        ')
+        # A provenance marker may be literal data in a heredoc or quote.
+        # Cut only when the prefix is a complete script; leave ambiguous
+        # replies intact. Consume all input to avoid SIGPIPE under pipefail.
+        local before_provenance
+        before_provenance=$(printf '%s\n' "$code" | awk '
+            /^\[(served_by|exec_s|exit|stdout|stderr)\]/ { cut = 1 }
+            !cut { print }
+        ')
+        if [[ "$before_provenance" != "$code" ]] && script_parses "$before_provenance"; then
+            code="$before_provenance"
+        fi
         # A response with no bash block and real content is about to be run as
         # a shell command. That is almost always the model ending its turn with
         # a plain sentence (which fails "command not found") or forgetting the
@@ -1898,7 +2057,7 @@ extract_code() {
     # Prepend notices to stderr. Stderr is captured and shown back to the model
     # on its next turn, so these teach it what shellm did with its last reply.
     # Prepend rather than append so a notice fires even if the code exits early.
-    if [[ "$truncation_signal" == *TRUNCATED* ]]; then
+    if [[ "$truncation_signal" == *TRUNCATED* || "$calls_dropped" -eq 1 ]]; then
         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
     fi
     if [[ "$toolcall_lifted" -eq 1 ]]; then
@@ -1978,7 +2137,7 @@ cat /tmp/approach_a.txt /tmp/approach_b.txt
 
 Always redirect a sub-run's stdout and stderr to a file, as above. A backgrounded sub-run that writes to the pipes it inherited loses its output once the step that started it ends.
 
-A sub-run is silent while its own model call is thinking, and the inactivity watchdog knows about that: while a sub-run is alive the block is treated as working, so waiting on sub-runs does not get you killed at SHELLM_INACTIVITY_TIMEOUT. The limit that still applies is SHELLM_INACTIVITY_MAX (default 900s) of no output at all from the block, so size sub-work to finish inside it. For longer work, give each sub-run a smaller task, cap it with `--max-iterations`, or start it in one step and read its output file in a later step rather than waiting here.
+A sub-run is silent while its own model call is thinking, and the inactivity watchdog knows about that: while a sub-run is alive the block is treated as working, so waiting on sub-runs does not get you killed at SHELLM_INACTIVITY_TIMEOUT. The limit that still applies is SHELLM_INACTIVITY_MAX (default 900s) of no output at all from the block, so size sub-work to finish inside it. No block may run longer than SHELLM_MAX_EXEC_TIME (default 3600s) even while it prints. For longer work, give each sub-run a smaller task, cap it with `--max-iterations`, or start it in one step and read its output file in a later step rather than waiting here.
 
 Pass context to sub-runs with `-f FILE` or via stdin. Always give sub-runs a clear, self-contained task description — they have no memory of your conversation.
 
@@ -2945,6 +3104,7 @@ exit \$__shellm_rc
             local last_beacon=""
             local kill_reason=""
             local kill_limit=""
+            local started=$SECONDS
             while kill -0 "$exec_pid" 2>/dev/null; do
                 sleep 1
                 local cur_size
@@ -2973,6 +3133,9 @@ exit \$__shellm_rc
                 if [[ "$SHELLM_MAX_OUTPUT_SIZE" -gt 0 && "$cur_size" -ge "$SHELLM_MAX_OUTPUT_SIZE" ]]; then
                     kill_reason="output"
                     kill_limit="$SHELLM_MAX_OUTPUT_SIZE"
+                elif [[ "$SHELLM_MAX_EXEC_TIME" -gt 0 && $((SECONDS - started)) -ge "$SHELLM_MAX_EXEC_TIME" ]]; then
+                    kill_reason="wall"
+                    kill_limit="$SHELLM_MAX_EXEC_TIME"
                 elif [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
                     kill_reason="idle"
                     kill_limit="$SHELLM_INACTIVITY_TIMEOUT"
@@ -3063,15 +3226,25 @@ exit \$__shellm_rc
         _stdout_tmp=$(mktemp)
         printf '%s' "$clean_output" > "$_stdout_tmp"
 
-        # Record reasoning step (assistant role in multi-turn)
-        local reasoning_json
+        # Record reasoning step (assistant role in multi-turn). --rawfile, not
+        # --arg: both a full-budget thinking block and the extracted code block
+        # can exceed the kernel's per-argument cap (MAX_ARG_STRLEN, 128KB), and
+        # jq then dies before it starts, so the run ends with no step record at
+        # all (live 2026-09-26, "jq: Argument list too long"). Same pattern as
+        # the prompt, feedback, and shell-output records.
+        local reasoning_json _reasoning_thought_tmp _reasoning_cmd_tmp
+        _reasoning_thought_tmp=$(mktemp)
+        _reasoning_cmd_tmp=$(mktemp)
+        printf '%s' "$reasoning" > "$_reasoning_thought_tmp"
+        printf '%s' "$code" > "$_reasoning_cmd_tmp"
         reasoning_json=$(jq -n \
-            --arg thought "$reasoning" \
-            --arg cmd "$code" \
+            --rawfile thought "$_reasoning_thought_tmp" \
+            --rawfile cmd "$_reasoning_cmd_tmp" \
             --arg run_id "$_run_step_id" \
             --argjson llm_s "$_llm_s" \
             --argjson usage "$_usage_extra" \
             '{type:"reasoning", thought:$thought, cmd:$cmd, run_id:$run_id, llm_s:$llm_s} + $usage')
+        rm -f "$_reasoning_thought_tmp" "$_reasoning_cmd_tmp"
         printf '%s' "$reasoning_json" | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
 
         # Record shell-output step (user role in multi-turn)
@@ -3120,9 +3293,15 @@ exit \$__shellm_rc
             progress "Final answer received"
             local final_answer
             final_answer=$(cat "$final_path")
+            # --rawfile, not --arg: a full-budget final answer can exceed the
+            # kernel's 128KB per-argument cap and kill jq with "Argument list
+            # too long" (rc=126), same class as the reasoning record above.
+            local _final_tmp
+            _final_tmp=$(mktemp)
+            printf '%s' "$final_answer" > "$_final_tmp"
             rm -f "$final_path"
             printf '%s' "$(jq -n \
-                --arg content "$final_answer" \
+                --rawfile content "$_final_tmp" \
                 --arg run_id "$_run_step_id" \
                 '{type:"final", content:$content, run_id:$run_id}')" \
                 | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
@@ -3138,13 +3317,14 @@ exit \$__shellm_rc
                 _child_dir_name=$(basename "$run_name")
                 _from_traj_ref="$_child_dir_name"
                 jq -nc \
-                    --arg content "$final_answer" \
+                    --rawfile content "$_final_tmp" \
                     --arg from_traj "$_run_traj_id" \
                     --arg from_step "${_last_step_id:-}" \
                     --arg from_traj_ref "$_from_traj_ref" \
                     '{type:"merge", content:$content, from_traj:$from_traj, from_step:$from_step, from_traj_ref:$from_traj_ref}' \
                     | traj append --traj_dir "$_run_traj_dir" "$_SHELLM_PARENT_TRAJ_ID" >/dev/null 2>/dev/null || true
             fi
+            rm -f "$_final_tmp"
             return 0
         fi
 

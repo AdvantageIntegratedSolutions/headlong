@@ -59,7 +59,7 @@ The dispatcher is a background process launched by `thinkers start`. It:
 
 1. Reads all `subscriptions.jsonl` files from `$THINKERS_DIR/*/subscriptions.jsonl`
 2. Resolves each `traj_id` to a file path (defaults to `$TRAJ_DIR/$TRAJ_ID`)
-3. Creates a FIFO at `$IDENTITY_DIR/run/dispatch.fifo`
+3. Creates a FIFO at `/tmp/headlong-dispatch.XXXXXX/dispatch.fifo`, outside the identity dir so nothing the mind walks can open it, and records the path in `$IDENTITY_DIR/run/fifo_path`
 4. For each unique trajectory file, starts `tail -n 0 -F <file>` piped through a tagger that prefixes each line with the trajectory ID, all writing to the FIFO
 5. Starts a ticker that writes a `TICK` heartbeat line into the FIFO every second
 6. Main loop reads from FIFO:
@@ -123,7 +123,7 @@ This prevents infinite loops where a thinker reacts to its own output.
 ```
 $IDENTITY_DIR/run/
   dispatcher.pid        # PID of the dispatcher process
-  dispatch.fifo         # Named pipe for step routing
+  fifo_path             # Path of the step-routing named pipe (lives in /tmp)
   tail_pids             # One PID per line for tail -F and ticker processes
   pending/
     <name>.<type>.<epoch>.<seq>  # Queued message/action step awaiting FIFO replay

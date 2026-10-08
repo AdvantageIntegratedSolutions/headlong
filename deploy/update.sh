@@ -141,6 +141,13 @@ fi
 if [[ -f "$APP_DIR/deploy/split-bridge-env.sh" ]]; then
     sudo bash "$APP_DIR/deploy/split-bridge-env.sh" "$APP_DIR"
 fi
+# A separate MOTD entry preserves the collaborator box's existing login
+# instructions. It reads current checkout checks on every login.
+motd=$(bash "$APP_DIR/deploy/check-deploy.sh" --render-motd "$APP_DIR" "$SHELLM_HOME")
+sudo mkdir -p /etc/update-motd.d
+printf '%s\n' "$motd" | sudo tee /etc/update-motd.d/61-headlong-deploy >/dev/null
+sudo chmod 0755 /etc/update-motd.d/61-headlong-deploy
+
 if [[ -f /etc/systemd/system/headlong-slack-bridge.service ]]; then
     echo "==> Updating Slack bridge"
     # Dedicated user, as for Telegram: the agent runs as shellm and can read
@@ -202,8 +209,9 @@ sudo systemctl restart headlong-web
 
 for _ in $(seq 1 36); do
     if curl -fsS localhost:8080/api/health >/dev/null 2>&1; then
-        echo "==> Healthy: $(curl -fsS localhost:8080/api/health)"
-        echo "==> Now running: $(sudo -u shellm git -C "$APP_DIR" log -1 --oneline)"
+        echo "==> Web application is responding: $(curl -fsS localhost:8080/api/health)"
+        echo "==> Checkout: $(sudo -u shellm git -C "$APP_DIR" log -1 --oneline)"
+        bash "$APP_DIR/deploy/check-deploy.sh" "$APP_DIR" "$SHELLM_HOME"
         exit 0
     fi
     sleep 5

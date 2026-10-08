@@ -49,7 +49,7 @@ off_fields() { wc -w < "$OFF" | tr -d ' '; }
 msg m1 "$NICK" ada "hello one" 300
 msg m2 "$NICK" ada "hello two" 200
 [[ "$(n_hist)" -eq 2 ]] && ok "index built: 2 messages" || bad "index built" "$(n_hist)"
-[[ "$(off_fields)" -eq 4 ]] && ok "offset record carries offset, header, inode, size" || bad "offset record has 4 fields" "$(cat "$OFF")"
+[[ "$(off_fields)" -eq 7 ]] && ok "offset record carries offset, header, inode, size, three index sizes" || bad "offset record has 7 fields" "$(cat "$OFF")"
 msg m3 "$NICK" ada "hello three" 100
 [[ "$(n_hist)" -eq 3 ]] && ok "append path stays incremental" || bad "append path incremental" "$(n_hist)"
 
@@ -80,7 +80,7 @@ printf '%s %s\n' "$(cut -d' ' -f1 "$OFF")" "hdr-1" > "$OFF"
 idx_lines=$(wc -l < "$IDX" | tr -d ' ')
 err=$(chat history --with "$NICK" --json 2>&1 >/dev/null)
 ! grep -q 'rebuilding' <<< "$err" && ok "old offset record: no forced rebuild" || bad "old offset record: no forced rebuild" "$err"
-[[ "$(off_fields)" -eq 4 ]] && ok "old offset record: upgraded to 4 fields in passing" || bad "old offset record upgraded" "$(cat "$OFF")"
+[[ "$(off_fields)" -eq 7 ]] && ok "old offset record: upgraded to 7 fields in passing" || bad "old offset record upgraded" "$(cat "$OFF")"
 [[ "$(wc -l < "$IDX" | tr -d ' ')" -eq "$idx_lines" ]] && ok "old offset record: index untouched" || bad "old offset record: index untouched"
 msg m5 "$NICK" ada "after the upgrade" 10
 [[ "$(n_hist)" -eq 3 ]] && ok "append after upgrade still incremental" || bad "append after upgrade" "$(n_hist)"
@@ -93,7 +93,7 @@ grep -q 'header changed\|replaced' <<< "$err" && ok "header change: rebuild anno
 
 # 6. a header pretty-printed over several lines (2026-09-14: an identity
 # rewrote its own header that way) is read as one header: one rebuild for the
-# rewrite, then none, the offset record keeps four fields, and appends stay
+# rewrite, then none, the offset record keeps its fields, and appends stay
 # incremental. Before the fix every call rebuilt from byte zero.
 { printf '{\n  "type": "trajectory",\n  "step_id": "hdr-3",\n  "ts": "%s",\n  "hmac_key": "k"\n}\n' "$(ago 99999)"; tail -n +2 "$TRAJ"; } > "$TRAJ.tmp" && mv "$TRAJ.tmp" "$TRAJ"
 chat history --with "$NICK" --json >/dev/null 2>&1
@@ -107,7 +107,7 @@ err=$(chat history --with "$NICK" --json 2>&1 >/dev/null)
 # 7. a header with no id never leaves an empty field in the offset record
 { printf '{"type":"trajectory"}\n'; tail -n +7 "$TRAJ"; } > "$TRAJ.tmp" && mv "$TRAJ.tmp" "$TRAJ"
 chat history --with "$NICK" --json >/dev/null 2>&1
-[[ "$(off_fields)" -eq 4 ]] && ok "header without an id: offset record still has 4 fields" || bad "header without an id: 4 fields" "$(cat "$OFF")"
+[[ "$(off_fields)" -eq 7 ]] && ok "header without an id: offset record still has 7 fields" || bad "header without an id: 7 fields" "$(cat "$OFF")"
 err=$(chat history --with "$NICK" --json 2>&1 >/dev/null)
 ! grep -q 'rebuilding' <<< "$err" && ok "header without an id: no rebuild loop" || bad "header without an id: no rebuild loop" "$err"
 
