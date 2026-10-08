@@ -213,20 +213,73 @@ action_prefilter() {
 action_search() {
     # Callers signal this public PID. Give the worker and its descendants a
     # separate process group so cancellation also stops the model and heartbeat.
-    local worker rc=0
-    set -m
-    _search_worker "$@" & worker=$!
-    set +m
+    local worker="" rc=0 _bound_pid="" _bound_dir="" _bound_mark=""
+    # MEM_SEARCH_TIMEOUT_S: seconds (default 300; slowest first token seen
+    # on the box was 31s), 0 waits forever, junk falls back to 300.
+    local t="${MEM_SEARCH_TIMEOUT_S:-300}"
+    [[ "$t" =~ ^[0-9]+$ ]] || t=300
+    if [[ "$t" != 0 ]]; then
+        # A predictable marker in shared /tmp could follow an attacker's
+        # symlink. mktemp creates a private directory before any child starts.
+        _bound_dir=$(mktemp -d "${TMPDIR:-/tmp}/mem-search-bound.XXXXXX") || return 1
+        _bound_mark="$_bound_dir/deadline"
+    fi
+    _stop_search_bound() {
+        if [[ -n "$_bound_pid" ]]; then
+            kill -KILL -- "-$_bound_pid" 2>/dev/null || true
+            wait "$_bound_pid" 2>/dev/null || true
+        fi
+    }
+    _remove_search_bound() {
+        if [[ -n "$_bound_dir" ]]; then
+            rm -f "$_bound_mark"
+            rmdir "$_bound_dir"
+        fi
+    }
     _cancel_search() {
         trap '' TERM INT
-        kill -KILL -- "-$worker" 2>/dev/null || true
-        wait "$worker" 2>/dev/null || true
+        _stop_search_bound
+        if [[ -n "$worker" ]]; then
+            kill -KILL -- "-$worker" 2>/dev/null || true
+            wait "$worker" 2>/dev/null || true
+        fi
+        _remove_search_bound
         exit "$1"
     }
     trap '_cancel_search 143' TERM
     trap '_cancel_search 130' INT
+    set -m
+    _search_worker "$@" & worker=$!
+    set +m
+    # Bound (issue 119): the heartbeat feeds the host's inactivity watchdog,
+    # so a wedged model needs an independent deadline. A sibling watchdog
+    # kills the worker group, without regrouping the model as timeout(1)
+    # would. Force cancellation: TERM alone lets an ignoring model survive
+    # its worker and keep the caller's pipes open indefinitely.
+    if [[ "$t" != 0 ]]; then
+        set -m
+        (
+            sleep "$t"
+            kill -0 -- "-$worker" 2>/dev/null || exit 0
+            : > "$_bound_mark"
+            kill -KILL -- "-$worker" 2>/dev/null || true
+        ) >/dev/null 2>&1 </dev/null & _bound_pid=$!
+        set +m
+    fi
     # Unlike a foreground function call, wait is interrupted by trapped signals.
     wait "$worker" || rc=$?
+    _stop_search_bound
+    if [[ -n "$_bound_mark" && -f "$_bound_mark" ]]; then
+        # The leader can exit between the mark and the signal. Stopping the
+        # watchdog must not skip cancellation of surviving group members.
+        kill -KILL -- "-$worker" 2>/dev/null || true
+        # A mark with rc 0 can race a successful completion.
+        if [[ "$rc" -ne 0 ]]; then
+            rc=124
+            printf 'mem search: no reply from the model within %ss (MEM_SEARCH_TIMEOUT_S); giving up on this query.\n' "$t" >&2
+        fi
+    fi
+    _remove_search_bound
     trap - TERM INT
     return "$rc"
 }
@@ -290,9 +343,14 @@ $(cat "$f")
         _hb_pid=$!
     fi
     local rc=0
+    # Keep the real llm adapter in our worker group. Otherwise llm's own
+    # deadline regroups it, and cancelling search kills its supervisor but
+    # leaves the adapter alive holding our caller's output pipes.
+    # This also applies with the search deadline disabled: public TERM/INT
+    # must still cancel the whole tree. llm retains its own shorter bound.
     # shellcheck disable=SC2086
     printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
-        llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
+        _LLM_SHARED_PROCESS_GROUP=1 llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
             -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" || rc=$?
     # The EXIT trap owns heartbeat cleanup; a second wait here would print
     # "not a child" once the trap has already reaped it.
@@ -411,6 +469,16 @@ action_edit() {
             *) break ;;
         esac
     done
+
+    # A flag mem edit does not know must not become the body: three times
+    # (2026-09-24 19:39Z, 2026-09-25 15:41Z, 2026-09-26 00:04Z) a body meant
+    # to follow --apply ran as `mem edit <id> --apply <body>` and the bare
+    # --apply token silently became the whole memory, exit 0. Same guard as
+    # mem add (PR 134): text that truly starts with a dash goes on stdin.
+    if [[ "${1:-}" == -* ]]; then
+        die "edit: unknown option '$1'. mem edit takes only --slug, then the text:
+  mem edit <id> [--slug SLUG] <text>      (or the text on stdin)"
+    fi
 
     local text="$*"
     if [[ -z "$text" ]]; then
@@ -538,6 +606,9 @@ Environment:
                          model thinks against it, so keep it roomy)
   MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
                          model works (10; 0 disables)
+  MEM_SEARCH_TIMEOUT_S    Total seconds stage 2 may run before giving up (300;
+                         0 waits forever; junk falls back to 300). A timed-out
+                         search prints one line to stderr and exits 124.
   SHELLM_FAST_MODEL      Cheap model class for the search call
 EOF
     exit 0

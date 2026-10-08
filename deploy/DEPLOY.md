@@ -109,10 +109,52 @@ terraform deploy writes this drop-in automatically.)
 **Updating:**
 
 ```bash
-sudo -u shellm git -C /opt/shellm/app pull
-sudo -u shellm rm -rf /opt/shellm/app/web/src/headlong_web/static  # forces frontend rebuild
-sudo systemctl restart headlong-web
+sudo bash /opt/shellm/app/deploy/update.sh
 ```
+
+This pulls the code, installs the deployment configuration, rebuilds the
+frontend and restarts the web service. Running thinker dispatchers keep
+running. The dashboard's "Pull latest & restart" updates the checkout and
+web app; run `deploy/update.sh` to apply system configuration changes.
+
+**Upgrading from an older updater:** if the copy of `update.sh` you start
+predates its re-exec guard, it keeps running its old steps after pulling
+the new copy. It can print `Healthy` while skipping newer steps. Run the
+command above a second time once to apply them. Later updates re-exec the
+pulled script when it changes.
+
+`Web application is responding` refers to the HTTP health endpoint.
+The separate `Deploy configuration` result checks installed thinker unit
+files, the sandbox flag against the presence of its systemd configuration,
+and whether Slack bridge token assignments remain in the shared `.env`.
+Pending steps name the missing configuration and print the update command;
+the current updater returns nonzero even if the web app responds. The
+operator command `deploy/scripts/update` also checks after an old updater
+finishes, using the newly pulled copy.
+
+Check without updating using `deploy/scripts/status` from your laptop, or
+on the box:
+
+```bash
+sudo bash /opt/shellm/app/deploy/check-deploy.sh /opt/shellm/app
+```
+
+The check changes nothing and never sources `.env` or displays token
+values. It exits 0 for the checked installed configuration, 1 for pending
+steps and 2 when it cannot inspect the configuration. After setup/update,
+login also shows pending steps through `/etc/update-motd.d/61-headlong-deploy`.
+The login and operator status checks run checkout code as `shellm`, even
+though PAM and SSM invoke their wrappers as root. If that user cannot read
+the configuration, the check reports an inspection failure.
+
+A deliberately disabled sandbox (`HEADLONG_SANDBOX=0`) with no sandbox
+configuration is valid. The check does not prove that a running thinker
+has loaded installed settings: sandbox changes take effect after an
+explicit `headlong-thinkersctl restart <identity>`. It also does not check
+whether silence timers are running, or prove full credential isolation.
+Bridge-file isolation depends on sandboxing; the bridge migration initially
+copies the bot token into `HEADLONG_ALERT_TOKEN` until an operator replaces
+it with a dedicated alert-only token (see `deploy/split-bridge-env.sh`).
 
 **Thinker dispatchers run as per-identity systemd units.** When the dash
 (or the Slack bootstrap) starts an identity's thinkers, the dispatcher runs
@@ -149,6 +191,79 @@ pre-demo backup. Two caveats:
 
   Uploads are also capped server-side via `HEADLONG_WEB_MAX_IMPORT_MB`
   (default 512).
+
+## Restoring an identity from a snapshot
+
+The persona boxes (terraform-slack, terraform-harris) snapshot their root
+volume every night through Data Lifecycle Manager (`backup.tf`): 14 daily
+and 8 weekly snapshots in the box's region, plus encrypted copies in
+`backup_copy_region` (default `ap-southeast-1`) kept 7 days and 8 weeks.
+The identities live on that volume under `/var/lib/headlong/identities`.
+Snapshots are crash consistent; the trajectory is append-only, so at worst
+its last line is torn.
+
+Everything below runs from a laptop with AWS SSO and changes nothing on
+the live identity. Set `R=ap-southeast-2` and `STACK=shellm-slack` (or
+`shellm-harris`).
+
+1. Pick a snapshot:
+
+   ```bash
+   aws --region $R ec2 describe-snapshots --owner-ids self \
+     --filters Name=tag:headlong-backup,Values=$STACK \
+     --query 'sort_by(Snapshots,&StartTime)[].[SnapshotId,StartTime,Tags[?Key==`headlong-backup-schedule`]|[0].Value]' \
+     --output table
+   ```
+
+   If the home region is gone or its snapshots are, list the copies with
+   `--region ap-southeast-1` and bring one back with
+   `aws --region $R ec2 copy-snapshot --source-region ap-southeast-1 --source-snapshot-id <snap>`.
+
+2. Make a volume from it in the box's availability zone and attach it as a
+   second disk (the box keeps running):
+
+   ```bash
+   I=$(terraform -chdir=deploy/terraform-slack output -raw instance_id)   # or read it from deploy/scripts/status
+   AZ=$(aws --region $R ec2 describe-instances --instance-ids $I --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+   V=$(aws --region $R ec2 create-volume --snapshot-id <snap> --availability-zone $AZ --volume-type gp3 \
+         --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=restore-scratch}]' --query VolumeId --output text)
+   aws --region $R ec2 wait volume-available --volume-ids $V
+   aws --region $R ec2 attach-volume --volume-id $V --instance-id $I --device /dev/sdf
+   ```
+
+   The scratch volume has no `headlong-backup` tag, so DLM never snapshots it.
+
+3. Mount it read-only on the box. `noload` skips journal replay, which a
+   crash-consistent snapshot would otherwise need, and keeps the disk
+   untouched:
+
+   ```bash
+   deploy/scripts/run 'lsblk -o NAME,SIZE,MOUNTPOINT; sudo mkdir -p /mnt/restore && sudo mount -o ro,noload /dev/nvme1n1p1 /mnt/restore && ls /mnt/restore/var/lib/headlong/identities'
+   ```
+
+   Check the device name in the `lsblk` output first; it is the disk with
+   no mountpoint.
+
+4. Copy out what you need, for example
+   `sudo cp -a /mnt/restore/var/lib/headlong/identities/audel /opt/shellm/backups/audel-from-<snap>`.
+   Putting it back into a live identity is a separate decision: stop the
+   dispatcher first (`sudo headlong-thinkersctl stop audel`), because the
+   trajectory must never be replaced under a running feeder: the feeder
+   follows the file by name and replays a replaced file through the mind
+   (the 2026-09-12 replay incident).
+
+5. Clean up. Do this before any reboot: the clone carries the same
+   filesystem label as the root disk, and a box that boots with both
+   attached can pick the wrong one.
+
+   ```bash
+   deploy/scripts/run 'sudo umount /mnt/restore'
+   aws --region $R ec2 detach-volume --volume-id $V && aws --region $R ec2 wait volume-available --volume-ids $V
+   aws --region $R ec2 delete-volume --volume-id $V
+   ```
+
+If the whole box is gone, the same volume can be attached to any instance
+in that zone, or the snapshot registered as the root of a fresh one.
 
 ## Migrating a pre-rename box (one time)
 

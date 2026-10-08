@@ -267,20 +267,6 @@ _get_summary() {
     printf '%s' "$raw"
 }
 
-# Check if a trajectory file is a root (first step is trajectory without parent).
-_is_root_file() {
-    local traj_file="$1"
-    [[ -f "$traj_file" ]] || return 1
-    local first_type first_parent
-    first_type=$(head -1 "$traj_file" | jq -r '.type // empty' 2>/dev/null)
-    if [[ "$first_type" == "trajectory" ]]; then
-        first_parent=$(head -1 "$traj_file" | jq -r '.parent_traj // .parent // empty' 2>/dev/null)
-        [[ -z "$first_parent" ]] && return 0 || return 1
-    fi
-    # Not a trajectory step — treat as root (legacy shellm-run files etc.)
-    return 0
-}
-
 # Resolve the parent traj file directly. Uses parent_ref (fast) or falls back to UUID search.
 # Prints the parent file path, or returns 1 if no parent.
 _resolve_parent_file() {
@@ -402,6 +388,60 @@ cmd_new() {
 # append
 # ---------------------------------------------------------------------------
 
+
+# Redact credentials at the write point. The log is append only and rewriting
+# it has crashed the dispatcher before, so the only safe place to stop a secret
+# is before the line lands. Shape rules cover credential formats whatever their
+# origin, value rules cover the tokens this machine holds in its environment.
+# Operate on decoded strings: JSON escaping must neither hide a configured
+# value nor turn a multiline redaction into invalid JSON. Keep values out of
+# process arguments, and finish before any blob write or append lock.
+traj_redact() {
+    printf '%s' "$1" | jq -c '
+        (["GITHUB_TOKEN", "GH_TOKEN", "HOMEBREW_GITHUB_API_TOKEN", "GITHUB_PAT",
+          "ANTHROPIC_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+          "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENCODE_API_KEY", "SLACK_BOT_TOKEN",
+          "SLACK_APP_TOKEN", "SLACK_USER_TOKEN", "SLACK_TOKEN", "TELEGRAM_BOT_TOKEN",
+          "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+          "AWS_SESSION_TOKEN", "AWS_ACCESS_KEY_ID", "STRIPE_SECRET_KEY",
+          "SENDGRID_API_KEY", "TWILIO_AUTH_TOKEN", "DATABASE_URL", "REDIS_URL"]
+         | map(env[.] // "") | map(select(length >= 8))) as $values |
+        def redact_string:
+            reduce $values[] as $v (. ; split($v) | join("<redacted:value>"))
+            | gsub("gh[pousr]_[A-Za-z0-9]{20,}"; "<redacted:github-token>")
+            | gsub("github_pat_[A-Za-z0-9_]{20,}"; "<redacted:github-token>")
+            | gsub("xox[a-z]-[A-Za-z0-9_.-]{10,}"; "<redacted:slack-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])sk-[A-Za-z0-9_.=-]{20,}"; "\(.edge)<redacted:api-key>")
+            | gsub("hf_[A-Za-z0-9]{20,}"; "<redacted:hf-token>")
+            | gsub("AIza[A-Za-z0-9_-]{30,}"; "<redacted:google-key>")
+            | gsub("(AKIA|ASIA)[A-Z0-9]{16}"; "<redacted:aws-key>")
+            | gsub("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"; "<redacted:jwt>")
+            | gsub("://[^/@[:space:]]+:[^/@[:space:]]+@"; "://<redacted:basic-auth>@")
+            | gsub("-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"; "<redacted:private-key>"; "p")
+            | gsub("\"auth\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]{16,}\""; "\"auth\": \"<redacted:docker-auth>\"")
+            | gsub("(?<edge>^|[^A-Za-z0-9])(sk|rk)_live_[A-Za-z0-9]{8,}"; "\(.edge)<redacted:stripe-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])whsec_[A-Za-z0-9]{8,}"; "\(.edge)<redacted:stripe-hook>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])npm_[A-Za-z0-9]{20,}"; "\(.edge)<redacted:npm-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])glpat-[A-Za-z0-9_-]{10,}"; "\(.edge)<redacted:gitlab-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])dckr_pat-[A-Za-z0-9_.-]{10,}"; "\(.edge)<redacted:docker-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])SG\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"; "\(.edge)<redacted:sendgrid-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])SK[0-9a-f]{32}"; "\(.edge)<redacted:twilio-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])key-[A-Za-z0-9]{20,}"; "\(.edge)<redacted:mailgun-key>")
+            | gsub("(?<name>(aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+"; "\(.name)=<redacted:aws-secret>");
+        def redact_record:
+            if type == "string" then redact_string
+            elif type == "array" then map(redact_record)
+            elif type == "object" then with_entries(
+                .key |= redact_string |
+                .value |= redact_record |
+                if .key == "auth" and (.value | type) == "string"
+                    and (.value | test("^[A-Za-z0-9+/=]{16,}$"))
+                then .value = "<redacted:docker-auth>" else . end)
+            else . end;
+        redact_record
+    '
+}
+
 cmd_append() {
     local traj_dir_opt="" traj_id_opt=""
     local -a fields=()
@@ -470,6 +510,14 @@ cmd_append() {
     local iso_ts
     iso_ts=$(_iso_ts)
     record=$(printf '%s' "$record" | jq --arg id "$step_id" --arg ts "$iso_ts" '. + {step_id: $id, ts: $ts}')
+
+    # A complete, valid sanitized record is required before any payload is
+    # persisted. Suppress sanitizer diagnostics: they may echo its input.
+    record=$(traj_redact "$record" 2>/dev/null) || die "append: credential sanitization failed"
+    [[ -n "$record" ]] && printf '%s' "$record" | jq -e 'type == "object"' >/dev/null 2>&1 \
+        || die "append: credential sanitization returned invalid JSON"
+    # Blob names, references, and the returned id must use the sanitized id too.
+    step_id=$(printf '%s' "$record" | jq -r '.step_id')
 
     # Process stdout: spill if over limit.
     local stdout_val
@@ -745,6 +793,13 @@ cmd_show() {
 _collect_recursive_files() {
     local traj_file="$1"
     [[ -f "$traj_file" ]] || return 0
+    traj_file=$(realpath "$traj_file") || return 1
+    # Fork records are stored data and may contain cycles (including legacy
+    # or hand-edited trajectories). Track only the current ancestry so shared
+    # children can still appear under each fork, while recursion always ends.
+    local _traj_ancestors="${_traj_ancestors:-$'\n'}"
+    case "$_traj_ancestors" in *$'\n'"$traj_file"$'\n'*) return 0 ;; esac
+    _traj_ancestors+="$traj_file"$'\n'
     printf '%s\n' "$traj_file"
 
     local parent_dir fork_lines
@@ -1197,6 +1252,188 @@ TAILHELP
 # search
 # ---------------------------------------------------------------------------
 
+
+# The serialized lines `traj search` prefilters are JSON, so every field
+# value jq wrote has quotes, backslashes, tabs, and control characters
+# escaped. A pattern that matches a decoded field does not necessarily
+# match its escaped form, so prefiltering on the raw pattern silently
+# drops rows the search should return: a quoted literal, a literal tab or
+# backslash, a regex dot or character class over an escaped character,
+# an anchor at the value open or at an interior decoded line. The two
+# translators below emit a pattern that matches the serialized line
+# whenever the original matches the decoded field: a fixed string through
+# the escape table (a decoded match always appears contiguously in its
+# escaped form), and a regex into a per-node superset that admits the
+# escaped image of anything the node can match. The translated pattern
+# can only widen the candidate set; the per-row decoded grep above stays
+# the judge of truth.
+
+# REPLY := the bytes one character takes inside a jq-serialized string.
+_jq_image() {
+    local c="$1" code
+    if [[ "$c" == '\' ]]; then REPLY='\\'
+    elif [[ "$c" == '"' ]]; then REPLY='\"'
+    elif [[ "$c" == $'\n' ]]; then REPLY='\n'
+    elif [[ "$c" == $'\r' ]]; then REPLY='\r'
+    elif [[ "$c" == $'\t' ]]; then REPLY='\t'
+    elif [[ "$c" == $'\b' ]]; then REPLY='\b'
+    elif [[ "$c" == $'\f' ]]; then REPLY='\f'
+    else
+        LC_ALL=C printf -v code '%d' "'$c"
+        # Bash 3.2 can report a negative value for a high-bit byte.
+        # Only ASCII controls are escaped; preserve non-ASCII text as-is.
+        if (( (code >= 0 && code < 32) || code == 127 )); then
+            LC_ALL=C printf -v REPLY '\\u%04x' "$code"
+        else
+            REPLY="$c"
+        fi
+    fi
+}
+
+# REPLY := s with every ERE metacharacter backslash-escaped, so a literal
+# fragment can be spliced into a translated regex.
+_ere_quote() {
+    local s="$1" out="" i c
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == '\' || "$c" == '.' || "$c" == '[' || "$c" == '(' \
+           || "$c" == ')' || "$c" == '*' || "$c" == '+' || "$c" == '?' \
+           || "$c" == '{' || "$c" == '|' || "$c" == '^' || "$c" == '$' ]]; then
+            out+="\\$c"
+        else
+            out+="$c"
+        fi
+    done
+    REPLY="$out"
+}
+
+# REPLY := a -F pattern translated for the serialized line. A newline in
+# the pattern splits it into alternatives the way grep reads it, so each
+# line is translated on its own and the images stay newline-free.
+_traj_prefilter_literal() {
+    # REPLY := a -F pattern translated for the serialized line. A newline
+    # in the pattern splits it into alternatives the way grep reads it,
+    # so each line is translated on its own and the images stay
+    # newline-free.
+    local p="$1"
+    local rest="$p"
+    local line piece i c
+    local -a pieces=()
+    while :; do
+        line="${rest%%$'\n'*}"
+        piece=""
+        for (( i=0; i<${#line}; i++ )); do
+            c="${line:i:1}"
+            _jq_image "$c"
+            piece+="$REPLY"
+        done
+        pieces+=("$piece")
+        if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else break; fi
+    done
+    local IFS=$'\n'
+    REPLY="${pieces[*]}"
+}
+
+
+_traj_prefilter_regex() {
+    # REPLY := an -E pattern translated into a superset that matches the
+    # serialized line whenever the original matches the decoded field.
+    # Anchors are dropped (the decoded grep re-imposes them, including at
+    # interior decoded lines, which the serialized line cannot see); . and
+    # character classes admit the escaped image of any character they can
+    # match; \w is kept because jq never escapes word characters. Nodes
+    # the translator cannot make tight are widened, never dropped: \b and
+    # friends are zero-width and vanish, a backreference becomes .*, a
+    # class it cannot parse bypasses the prefilter, and an unterminated
+    # class is the literal text GNU grep takes it for. A trailing backslash,
+    # which makes the decoded grep itself error, also yields the empty
+    # pattern. Every branch widens or preserves the
+    # candidate set, so none can silently drop a row the search should
+    # return, and the widening stays local so common patterns keep a
+    # tight prefilter.
+    local p="$1"
+    local rest="$p"
+    local line out i n c nxt k j neg complex raw delimiter
+    local -a pieces=()
+    while :; do
+        line="${rest%%$'\n'*}"
+        out="" i=0 n=${#line}
+        while (( i < n )); do
+            c="${line:i:1}"
+            if [[ "$c" == '\' ]]; then
+                if (( i+1 >= n )); then out=""; break; fi
+                nxt="${line:i+1:1}"
+                i=$((i+2))
+                case "$nxt" in
+                    w) out+='\w' ;;
+                    s|W|S) out+='(.|\\.|\\u[0-9a-f]{4})' ;;
+                    b|B|'<'|'>') : ;;
+                    [0-9]) out+='.*' ;;
+                    *) _jq_image "$nxt"; _ere_quote "$REPLY"
+                       # An escaped character is one regex atom, even when
+                       # its serialized image occupies several characters.
+                       if (( ${#REPLY} > 1 )); then REPLY="($REPLY)"; fi
+                       out+="$REPLY" ;;
+                esac
+            elif [[ "$c" == '.' ]]; then
+                out+='(.|\\.|\\u[0-9a-f]{4})'; i=$((i+1))
+            elif [[ "$c" == '^' || "$c" == '$' ]]; then
+                i=$((i+1))
+            elif [[ "$c" == '[' ]]; then
+                k=$((i+1)); neg=0; complex=0
+                if [[ "${line:k:1}" == '^' ]]; then neg=1; k=$((k+1)); fi
+                if [[ "${line:k:1}" == ']' ]]; then k=$((k+1)); fi
+                while (( k < n )) && [[ "${line:k:1}" != ']' ]]; do
+                    if [[ "${line:k:1}" == '\' ]]; then
+                        # Backslash in a bracket expression is not a portable
+                        # escape (BSD grep may end the class at the next ]).
+                        # Do not guess where it ends: bypass the prefilter.
+                        REPLY=""; return
+                    elif [[ "${line:k:1}" == '[' ]]; then
+                        delimiter="${line:k+1:1}"
+                        if [[ "$delimiter" == ':' || "$delimiter" == '.' || "$delimiter" == '=' ]]; then
+                            j=$((k+2))
+                            while (( j+1 < n )) && [[ "${line:j:2}" != "$delimiter]" ]]; do j=$((j+1)); done
+                            # Do not leave an inner terminator's ] behind as
+                            # a required literal. If parsing is uncertain,
+                            # admit every candidate; decoded grep is the judge.
+                            if (( j+1 >= n )); then REPLY=""; return; fi
+                            complex=1; k=$((j+2))
+                        else
+                            complex=1; k=$((k+1))
+                        fi
+                    else
+                        k=$((k+1))
+                    fi
+                done
+                if (( k >= n )); then
+                    _ere_quote '['; out+="$REPLY"; i=$((i+1))
+                else
+                    if (( neg )) || (( complex )); then
+                        out+='(.|\\.|\\u[0-9a-f]{4})'
+                    else
+                        raw="${line:i:k-i+1}"
+                        out+='('"${raw}"'|\\.|\\u[0-9a-f]{4})'
+                    fi
+                    i=$((k+1))
+                fi
+            elif [[ "$c" == '(' || "$c" == ')' || "$c" == '|' || "$c" == '*' \
+                 || "$c" == '+' || "$c" == '?' || "$c" == '{' || "$c" == '}' ]]; then
+                out+="$c"; i=$((i+1))
+            else
+                _jq_image "$c"; _ere_quote "$REPLY"
+                if (( ${#REPLY} > 1 )); then REPLY="($REPLY)"; fi
+                out+="$REPLY"; i=$((i+1))
+            fi
+        done
+        pieces+=("$out")
+        if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else break; fi
+    done
+    local IFS=$'\n'
+    REPLY="${pieces[*]}"
+}
+
+
 cmd_search() {
     local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0 tail_n=0
     while [[ $# -gt 0 ]]; do
@@ -1270,14 +1507,24 @@ cmd_search() {
         # row: ~859 rows here at ~60ms each, ~52s of silence, past the 30s
         # inactivity watchdog (2026-09-23; the same shape killed a 136K-row
         # search 2026-09-09).
-        local _cand _pre
+        local _cand _pre _pfilter
         _cand=$(mktemp) || die "search: mktemp failed"
         _pre=("$grep_mode")
         [[ -n "$case_flag" ]] && _pre+=("$case_flag")
-        if [[ "$tail_n" -gt 0 ]]; then
-            tail -n "$tail_n" -- "$_sf" | grep "${_pre[@]}" -e "$pattern" > "$_cand" || true
+        # Prefilter with the translated pattern, never the raw one: a match
+        # in a decoded field appears in the serialized line only in its
+        # escaped form, so the raw pattern silently drops candidate rows.
+        # The translation can only widen the candidate set.
+        if [[ "$use_regex" -eq 1 ]]; then
+            _traj_prefilter_regex "$pattern"
         else
-            grep "${_pre[@]}" -e "$pattern" -- "$_sf" > "$_cand" || true
+            _traj_prefilter_literal "$pattern"
+        fi
+        _pfilter="$REPLY"
+        if [[ "$tail_n" -gt 0 ]]; then
+            tail -n "$tail_n" -- "$_sf" | grep "${_pre[@]}" -e "$_pfilter" > "$_cand" || true
+        else
+            grep "${_pre[@]}" -e "$_pfilter" -- "$_sf" > "$_cand" || true
         fi
 
         # Row pass: inline candidates that carry no reference, in row order.
@@ -1839,7 +2086,11 @@ cmd_root() {
 _list_collect_children() {
     local traj_file="$1" traj_dir="$2" max_depth="$3" cur_depth="$4"
     [[ -f "$traj_file" ]] || return
+    traj_file=$(realpath "$traj_file") || return 1
     [[ "$cur_depth" -ge "$max_depth" ]] && return
+    local _traj_ancestors="${_traj_ancestors:-$'\n'}"
+    case "$_traj_ancestors" in *$'\n'"$traj_file"$'\n'*) return ;; esac
+    _traj_ancestors+="$traj_file"$'\n'
 
     local fork_lines
     fork_lines=$(jq -R -c 'fromjson? // empty | select(.type == "fork")' "$traj_file" 2>/dev/null || true)
@@ -1876,6 +2127,10 @@ _list_collect_children() {
 _render_steps_inline() {
     local file="$1" step_prefix="$2" traj_dir="$3" max_depth="$4" cur_depth="$5"
     [[ -f "$file" ]] || return
+    file=$(realpath "$file") || return 1
+    local _traj_ancestors="${_traj_ancestors:-$'\n'}"
+    case "$_traj_ancestors" in *$'\n'"$file"$'\n'*) return ;; esac
+    _traj_ancestors+="$file"$'\n'
 
     # Batch-process all steps with a single jq call.
     # Use \u001f (unit separator) as delimiter since tabs can appear in content.

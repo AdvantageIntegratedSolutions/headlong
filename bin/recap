@@ -51,7 +51,7 @@ BACKFILL=0                             # --backfill: also summarize pre-enable h
 FANOUT="${ROLLUP_FANOUT:-10}"          # F: children per tier; tier k covers F^k steps
 CTX_BUDGET="${MONOLITH_CONTEXT_BUDGET:-auto}"   # token budget; auto = fraction of model window
 CTX_RAW_TAIL="${ROLLUP_RAW_TAIL:-auto}"         # R: verbatim recent steps; auto = from budget
-ROLLUP_PROMPT_VERSION=3                 # stamped into sealed blocks for honest determinism (v2: first-person voice; v3: outcomes, not temperament)
+ROLLUP_PROMPT_VERSION=5                 # stamped into sealed blocks for honest determinism (v2: first-person voice; v3: outcomes, not temperament; v5: supersession citations)
 
 usage() {
     cat <<'EOF'
@@ -502,7 +502,7 @@ _print_json() {
 # cached forever; only the frontier (newly-complete blocks) is built each run.
 # See design/tiered_memory.md.
 
-_ROLLUP_SYSTEM='You are the AI agent whose life log this is. Summarize this one slice of your own history in the FIRST PERSON — say "I", never "the agent". The input is a chronological list of lines: either raw steps "[id] type: content", or child rollup summaries (already first person). Reply with ONLY a JSON object, no markdown fences:
+_ROLLUP_SYSTEM='You are the AI agent whose life log this is. Summarize this one slice of your own history in the FIRST PERSON — say "I", never "the agent". The input is a chronological list of lines: either raw steps "[id] type: content", or child rollup summaries (already first person). Child rollup summaries arrive prefixed by their step-id list, e.g. "[id1,id2] I did X"; when your summary corrects or supersedes a claim stated in an earlier child window supplied in this same input, and the correcting evidence is also present in this input, name that child by quoting its "[id,...]" prefix verbatim in your summary text, e.g. "this corrects [old-ids]: the earlier claim of X is superseded because Y". Cite only prefixes actually supplied here; do not invent or infer a prefix for an unseen window. This names a correction target in the new parent summary; it does not rewrite or link separately sealed siblings that are absent from this input. Reply with ONLY a JSON object, no markdown fences:
 {"summary": "2-3 first-person sentences on outcomes: what I did, decided, learned, and left open, naming people, artifacts, and threads. Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
  "themes": ["1-4 short kebab-case topics"],
  "step_ids": ["up to 4 of the most important 8-char step ids that literally appear in the input"]}'
@@ -644,7 +644,7 @@ _ctx_build() {
 # then the raw tail [cut0, N) verbatim. cut0 is snapped to an F boundary and the
 # older region is decomposed positionally (base-F), so coverage is gapless and
 # each tier contributes at most F-1 blocks.
-_ctx_assemble() {
+_ctx_assemble_base() {
     local n=$1 r=$2 cut0 remaining tier blk coarser chunk a x
     _CTX_START=${3:-0}
     cut0=$(( ((n - r) / FANOUT) * FANOUT )); (( cut0 < 0 )) && cut0=0
@@ -692,6 +692,109 @@ _ctx_assemble() {
     sed -n "$(( cut0 + 1 )),${n}p" "$RENDERED_TSV" | cut -f4
 }
 
+# Correction lookup is deliberately partial: at most 128 deterministic paths,
+# round-robin across tiers, newest first within each tier. No directory walk or
+# per-displayed-window history scan. Read at most 32 KiB (+1 overflow sentinel)
+# per candidate, once per assembly. Old/oversized/unreadable blocks remain
+# discoverable by an explicit search; they must not break the raw context.
+_ctx_prepare_namers() {
+    local n=$1 tier blk round end f body summary total=0 probes=0
+    _CTX_NAMER_FILES=(); _CTX_NAMER_TEXT=()
+    _CTX_NAMER_PARTIAL=0
+    local -a sizes=()
+    blk=$FANOUT
+    while (( blk <= n )); do
+        sizes+=("$blk")
+        total=$(( total + n / blk ))
+        (( blk > n / FANOUT )) && break
+        blk=$(( blk * FANOUT ))
+    done
+    (( total > 128 )) && _CTX_NAMER_PARTIAL=1
+    for (( round=0; round<128 && probes<128; round++ )); do
+        for (( tier=0; tier<${#sizes[@]} && probes<128; tier++ )); do
+            blk=${sizes[$tier]}
+            end=$(( (n / blk - round) * blk ))
+            (( end <= 0 )) && continue
+            probes=$((probes + 1))
+            printf -v f '%s/t%s/%012d-%012d.json' "$ROLLUP_DIR" "$((tier+1))" "$((end-blk))" "$end"
+            [[ -f "$f" ]] || continue
+            # head bounds bytes even if the file grows between stat and read.
+            body=$(LC_ALL=C head -c 32769 "$f" 2>/dev/null) || { _CTX_NAMER_PARTIAL=1; continue; }
+            if (( $(LC_ALL=C printf '%s' "$body" | wc -c) > 32768 )); then
+                _CTX_NAMER_PARTIAL=1; continue
+            fi
+            summary=$(printf '%s' "$body" | jq -er '.summary | select(type == "string")' 2>/dev/null) \
+                || { _CTX_NAMER_PARTIAL=1; continue; }
+            _CTX_NAMER_FILES+=("$f"); _CTX_NAMER_TEXT+=("$summary")
+        done
+        (( probes >= total )) && break
+    done
+    return 0
+}
+
+_ctx_emit_namers() {
+    (( _CTX_NAMER_ACTIVE )) || return 0
+    local bf=$1 key i line bytes
+    key=$(jq -er '.step_ids | select(type == "array" and length > 0)
+        | select(all(.[]; type == "string")) | "[" + join(",") + "]"' "$bf" 2>/dev/null) || return 0
+    for (( i=0; i<${#_CTX_NAMER_FILES[@]}; i++ )); do
+        [[ "${_CTX_NAMER_FILES[$i]}" == "$bf" ]] && continue
+        [[ "${_CTX_NAMER_TEXT[$i]}" == *"$key"* ]] || continue
+        # A citation is not proof of supersession: the writer may merely refer
+        # to a window. Preserve the evidence, don't label it a proven correction.
+        line="  [namer of the window above, cites it] ${_CTX_NAMER_TEXT[$i]}"
+        bytes=$(printf '%s\n' "$line" | LC_ALL=C wc -c)
+        if (( bytes <= _CTX_NAMER_LEFT )); then
+            printf '%s\n' "$line"
+            _CTX_NAMER_LEFT=$((_CTX_NAMER_LEFT - bytes))
+        else
+            _CTX_NAMER_PARTIAL=1
+        fi
+    done
+    return 0
+}
+
+# Existing base summaries/raw tail are never sacrificed for optional citations.
+# Measure that base first, then spend only unused budget (4 bytes/token, matching
+# the raw-tail approximation), capped at 20% of the allowance and 4096 bytes.
+# The base staircase itself retains its pre-existing approximate budget policy.
+_ctx_assemble() {
+    local n=$1 r=$2 start=${3:-0} base budget cap allowance bytes hint hint_bytes
+    base=$(mktemp "${TMPDIR:-/tmp}/recap-base.XXXXXX") || return 1
+    _CTX_NAMER_ACTIVE=0
+    if ! _ctx_assemble_base "$n" "$r" "$start" > "$base"; then
+        cat "$base"; rm -f "$base"; return 1
+    fi
+    bytes=$(LC_ALL=C wc -c < "$base")
+    if [[ "$CTX_BUDGET" == auto ]]; then
+        budget=$(( $(_ctx_model_window) * 6 / 10 ))
+        cap="${RECAP_CONTEXT_BUDGET_MAX:-4000}"
+        (( budget > cap )) && budget=$cap
+    else
+        budget=$CTX_BUDGET
+    fi
+    allowance=$((budget * 4 - bytes))
+    cap=$((budget * 4 / 5))
+    (( cap > 4096 )) && cap=4096
+    (( allowance > cap )) && allowance=$cap
+    hint='  [Citation lookup limited; search rollups/t*/ for exact [id,...] prefix.]'
+    hint_bytes=$(printf '%s\n' "$hint" | LC_ALL=C wc -c)
+    if (( allowance < hint_bytes )); then
+        # No optional bytes available: preserve base verbatim. stderr keeps the
+        # limitation discoverable even when the caller requests a tiny budget.
+        cat "$base"; rm -f "$base"
+        printf '%s\n' "$hint" >&2
+        return 0
+    fi
+    rm -f "$base"
+    _CTX_NAMER_LEFT=$((allowance - hint_bytes))
+    _ctx_prepare_namers "$n"
+    _CTX_NAMER_ACTIVE=1
+    _ctx_assemble_base "$n" "$r" "$start"
+    (( _CTX_NAMER_PARTIAL )) && printf '%s\n' "$hint"
+    return 0
+}
+
 # Emit one staircase segment. A missing block file is expected, not an
 # error: blocks older than the enable marker are deliberately never built
 # until --backfill, so dying here would cost the mind its whole context
@@ -721,6 +824,7 @@ _ctx_emit_seg() {
         jq -r '"[t\(.tier) · steps \(.start)–\(.end)] \(.summary)   (\(.step_ids | join(" ")))"' \
             "$bf" 2>/dev/null \
             || printf '[t%s · steps %s–%s] (unreadable rollup block)\n' "$tier" "$s" "$e"
+        _ctx_emit_namers "$bf"
         return 0
     fi
     (( tier <= 1 )) && return 0

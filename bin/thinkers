@@ -273,7 +273,7 @@ _start_dispatcher() {
     local run_dir="$IDENTITY_DIR/run"
     mkdir -p "$run_dir/logs" "$run_dir/thinkers"
 
-    local fifo="$run_dir/dispatch.fifo"
+    local fifo
     local pid_file="$run_dir/dispatcher.pid"
     local tail_pids_file="$run_dir/tail_pids"
 
@@ -287,9 +287,19 @@ _start_dispatcher() {
         rm -f "$pid_file"
     fi
 
-    # Create FIFO
-    rm -f "$fifo"
-    mkfifo "$fifo"
+    # Create the FIFO outside the identity dir. The mind walks its own
+    # identity dir, and anything that opens a fifo as a file blocks forever
+    # and steals step lines from the dispatcher (Audel 2026-09-25: a secret
+    # scan sat 3.5 h in read() on run/dispatch.fifo). /tmp, not $TMPDIR: a
+    # start from inside a shellm run gets a TMPDIR that dies with the run.
+    # run/fifo_path records where it is so stop and cleanup can find it.
+    _remove_fifo "$run_dir"
+    local fifo_dir
+    fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
+        || die "Could not create a fifo directory in /tmp"
+    fifo="$fifo_dir/dispatch.fifo"
+    mkfifo "$fifo" || die "Could not create $fifo"
+    printf '%s\n' "$fifo" > "$run_dir/fifo_path"
 
     # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
     rm -rf "$run_dir/pending"
@@ -369,7 +379,7 @@ _start_dispatcher() {
     done < <(_list_thinker_dirs)
 
     if [[ -z "$sub_map" ]]; then
-        rm -f "$fifo"
+        _remove_fifo "$run_dir"
         die "No valid subscriptions found"
     fi
 
@@ -1174,8 +1184,26 @@ _cleanup_run_state() {
         rm -f "$tail_pids_file"
     fi
     _kill_traj_tails "$run_dir" ${2:+"$2"}
-    rm -f "$run_dir/dispatch.fifo" "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
+    _remove_fifo "$run_dir"
+    rm -f "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
     rm -rf "$run_dir/pending"
+}
+
+# Remove the dispatcher fifo named by run/fifo_path, and the run/dispatch.fifo
+# that dispatchers before 2026-09-26 kept inside the identity dir. Only a path
+# of the shape _start_dispatcher makes is removed, since fifo_path sits in a
+# directory the mind can write.
+_remove_fifo() {
+    local run_dir="$1" path=""
+    path=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || true
+    case "$path" in
+        /tmp/headlong-dispatch.*/dispatch.fifo)
+            if [[ "$path" != *..* && -p "$path" ]]; then
+                rm -f "$path"
+                rmdir "${path%/dispatch.fifo}" 2>/dev/null || true
+            fi ;;
+    esac
+    rm -f "$run_dir/fifo_path" "$run_dir/dispatch.fifo"
 }
 
 _cleanup_dispatcher() {

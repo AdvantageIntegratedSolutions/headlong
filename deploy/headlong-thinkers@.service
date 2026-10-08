@@ -54,6 +54,17 @@ ExecStop=/bin/bash @SHELLM_HOME@/app/deploy/thinkers-service.sh @SHELLM_HOME@/ap
 # alert.
 Restart=on-failure
 RestartSec=60
+# Memory cap for the whole mind: dispatcher, steps, and anything they
+# spawn. Without it one runaway command in a wake exhausted the 8 GB box
+# (Audel's ad hoc python3 reading the whole trajectory into ~7.4 GB on
+# 2026-09-25, 09-28, and 09-29) and the global OOM killer fired from
+# headlong-web. With the cap the kernel kills inside this cgroup only, and
+# OOMPolicy=continue keeps the unit running: the runaway step dies, the
+# dispatcher does not (the default, stop, took the whole mind down each
+# time). Page cache from reading the trajectory counts toward the cap but
+# is reclaimed before anything is killed.
+MemoryMax=5G
+OOMPolicy=continue
 ExecStartPost=/bin/bash @SHELLM_HOME@/app/deploy/thinkers-death-alert.sh @SHELLM_HOME@/app %i started
 ExecStopPost=/bin/bash @SHELLM_HOME@/app/deploy/thinkers-death-alert.sh @SHELLM_HOME@/app %i died
 # The stop script waits out the CLI's drain (default 180s) before systemd's
