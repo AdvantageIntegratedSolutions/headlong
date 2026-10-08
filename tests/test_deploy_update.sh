@@ -227,8 +227,12 @@ run_script_on_box() { bash -c "$1"; }
     check('current update labels the HTTP check accurately',
           '==> Web application is responding:' in second.stdout and
           '==> Healthy:' not in second.stdout)
+    # The tokens go to the root-owned /etc/shellm/slack.env (rewritten under
+    # the scratch root), never to the shellm-owned .env.bridge.
+    slack_env = root / 'etc/shellm/slack.env'
     check('second update runs bridge migration',
-          (app / '.env.bridge').exists() and
+          slack_env.exists() and fake_app in slack_env.read_text() and
+          not (app / '.env.bridge').exists() and
           'SLACK_APP_TOKEN=' not in (app / '.env').read_text())
     p = diagnose()
     check('fully applied file configuration passes',
